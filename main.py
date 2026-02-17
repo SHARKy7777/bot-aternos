@@ -7,14 +7,12 @@ import os
 
 load_dotenv()
 
-# ============================================================
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
-OWNER_ID     = 123456789012345678  # ← Remplace par ton vrai ID
+OWNER_ID     = 715572086898294907  # ← Ton vrai ID Discord ici
 ATERNOS_USER = os.getenv("ATERNOS_USER")
 ATERNOS_PASS = os.getenv("ATERNOS_PASS")
 SERVER_NAME  = "lmanagil"
 PREFIX       = "!"
-# ============================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -199,20 +197,3 @@ async def p_help(ctx):
     await ctx.send(embed=embed)
 
 bot.run(BOT_TOKEN)
-```
-
----
-
-### Étape 3 — Vérifie que ton repo GitHub contient exactement ces fichiers
-```
-ton-repo/
-├── bot.py              ✅
-├── requirements.txt    ✅
-└── .gitignore          ✅
-```
-
-Et ton `requirements.txt` doit contenir :
-```
-discord.py==2.3.2
-python-aternos==2.1.0
-python-dotenv==1.0.0
