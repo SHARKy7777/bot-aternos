@@ -86,7 +86,7 @@ async def owner_check(ctx_or_interaction) -> bool:
 
 @tree.command(name="status", description="Statut actuel du serveur Minecraft")
 async def slash_status(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     status = check_server_status()
     if status["online"]:
         embed = discord.Embed(title=f"🎮 Serveur — {SERVER_ADDRESS}", color=discord.Color.green())
@@ -96,7 +96,7 @@ async def slash_status(interaction: discord.Interaction):
         embed.add_field(name="Latence", value=f"{status['latency']}ms", inline=True)
     else:
         embed = discord.Embed(title=f"🎮 Serveur — {SERVER_ADDRESS}", description="🔴 Le serveur est hors ligne", color=discord.Color.red())
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed)
 
 @tree.command(name="setchannel", description="Définir le salon pour les annonces (propriétaire uniquement)")
 async def slash_setchannel(interaction: discord.Interaction, channel: discord.TextChannel):
