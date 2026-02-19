@@ -403,11 +403,9 @@ async def slash_status(interaction: discord.Interaction):
         e.add_field(name="Ping",    value=f"{s['latency']}ms",                           inline=True)
         e.add_field(name="🎮 En ligne", value=", ".join(s["player_list"]) or "Personne", inline=False)
     else:
-        reason = s.get("reason", "Serveur éteint ou inaccessible")
+        reason = s.get("reason", "Serveur éteint")
         e = discord.Embed(
             title=f"🎮 {SERVER_DISPLAY_NAME}",
-            description=f"🔴 Hors ligne\n*{reason}*\n*(Sur Aternos, démarre-le manuellement)*",
-            color=discord.Color.red()
         )
     await interaction.followup.send(embed=e)
 
