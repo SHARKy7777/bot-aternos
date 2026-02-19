@@ -262,28 +262,23 @@ def process_events(events):
     return summary
 
 # ══════════════════════════════════════════════
-#  SERVEUR MC — CORRIGÉ
+#  SERVEUR MC — ASYNC
 # ══════════════════════════════════════════════
 
-def check_server_status():
-    """
-    CORRECTIF : On recrée l'objet JavaServer à chaque appel avec un timeout
-    strict de 5 secondes pour éviter les faux positifs sur Aternos.
-    """
+import asyncio
+
+async def check_server_status():
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _check_server_status_sync)
+
+def _check_server_status_sync():
     try:
-        # ✅ Recrée l'objet à chaque fois (évite le cache DNS/connexion)
-        server = JavaServer.lookup(SERVER_ADDRESS, timeout=5)
+        server = JavaServer.lookup(SERVER_ADDRESS, timeout=3)
         status = server.status()
 
-        # Vérifie que la réponse est cohérente (Aternos renvoie parfois 0/0)
-        if status.players.max == 0 and status.players.online == 0:
-            # Deuxième tentative pour confirmer
-            try:
-                status2 = server.status()
-                if status2.players.max == 0:
-                    return {"online": False, "player_list": [], "reason": "Serveur en veille (0/0)"}
-            except:
-                return {"online": False, "player_list": []}
+        # Aternos en veille repond avec 0/0 -> hors ligne
+        if status.players.max == 0:
+            return {"online": False, "player_list": []}
 
         try:
             query       = server.query()
@@ -295,8 +290,6 @@ def check_server_status():
             "online": True,
             "players": status.players.online,
             "max_players": status.players.max,
-            "version": status.version.name,
-            "latency": round(status.latency, 1),
             "player_list": player_list
         }
     except Exception as e:
@@ -338,7 +331,7 @@ async def on_ready():
 @tasks.loop(minutes=3)
 async def server_monitor():
     global previous_status, current_session_players
-    s = check_server_status()
+    s = await check_server_status()
     online = s["online"]
 
     if online:
@@ -395,7 +388,7 @@ def is_clan_leader(player_name, clan_name):
 @tree.command(name="status", description="Statut du serveur Minecraft")
 async def slash_status(interaction: discord.Interaction):
     await interaction.response.defer()
-    s = check_server_status()
+    s = await check_server_status()
     if s["online"]:
         e = discord.Embed(title=f"🎮 {SERVER_DISPLAY_NAME}", description="🟢 En ligne", color=discord.Color.green())
     else:
@@ -632,6 +625,63 @@ async def slash_joinclan(interaction: discord.Interaction, nom: str):
     count = len([p for p,c in clan_members.items() if c==nom])
     await interaction.followup.send(f"✅ Tu as rejoint **{nom}** ! ({count} membres au total)")
 
+
+@tree.command(name="setupclan", description="Créer un clan complet d'un coup : nom, chef et membres (proprio)")
+async def slash_setupclan(
+    interaction: discord.Interaction,
+    nom: str,
+    chef: str,
+    membres: str  # pseudos séparés par des virgules, ex: "Alice,Bob,Charlie"
+):
+    """
+    Crée un clan en une seule commande.
+    membres : pseudos séparés par des virgules (sans espaces autour)
+    Ex: /setupclan nom:Warriors chef:Steve membres:Alex,Notch,Herobrine
+    """
+    if not await owner_check(interaction): return
+    await interaction.response.defer(ephemeral=True)
+
+    # Vérif nom
+    if nom in clans:
+        await interaction.followup.send(f"❌ Le clan **{nom}** existe déjà", ephemeral=True); return
+    if len(nom) > CONFIG["MAX_CLAN_NAME_LENGTH"]:
+        await interaction.followup.send(f"❌ Nom max {CONFIG['MAX_CLAN_NAME_LENGTH']} caractères", ephemeral=True); return
+
+    # Parse les membres
+    membre_list = [m.strip() for m in membres.split(",") if m.strip()]
+    if not membre_list:
+        await interaction.followup.send("❌ Aucun membre valide fourni", ephemeral=True); return
+
+    # Ajoute le chef dans la liste si pas déjà dedans
+    if chef not in membre_list:
+        membre_list.insert(0, chef)
+
+    # Vérifie les conflits de clan
+    conflicts = [m for m in membre_list if m in clan_members]
+    if conflicts:
+        conflict_details = ", ".join([f"**{m}** (dans {clan_members[m]})" for m in conflicts])
+        await interaction.followup.send(f"❌ Ces joueurs sont déjà dans un clan : {conflict_details}", ephemeral=True); return
+
+    # Crée le clan
+    clans[nom] = {"leader": chef, "created": datetime.now().isoformat(), "points": 0}
+
+    # Ajoute tous les membres
+    added = []
+    for m in membre_list:
+        init_player(m)
+        clan_members[m] = nom
+        added.append(m)
+
+    save_data()
+
+    # Résumé
+    membres_str = "\n".join([f"{'👑' if m == chef else '👤'} {m}" for m in added])
+    e = discord.Embed(title=f"🛡️ Clan **{nom}** créé !", color=discord.Color.green())
+    e.add_field(name="👑 Chef",      value=chef,            inline=True)
+    e.add_field(name="👥 Membres",   value=str(len(added)), inline=True)
+    e.add_field(name="📋 Liste",     value=membres_str,     inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
 @tree.command(name="leaveclan", description="Quitter ton clan actuel")
 async def slash_leaveclan(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -713,6 +763,51 @@ async def slash_clanleaderboard(interaction: discord.Interaction):
         medal=["🥇","🥈","🥉"][i] if i<3 else f"{i+1}."
         e.add_field(name=f"{medal} {name}", value=f"👑 {data['leader']} • 👥 {members} membres • ⭐ {data['points']} pts", inline=False)
     await interaction.followup.send(embed=e)
+
+@tree.command(name="setupclan", description="Créer un clan complet en une seule fois (proprio)")
+async def slash_setupclan(interaction: discord.Interaction, nom: str, chef: str, membres: str = ""):
+    """
+    Crée un clan avec chef + membres en une seule commande.
+    membres : pseudos séparés par des virgules (ex: Steve,Alex,Notch)
+    """
+    if not await owner_check(interaction): return
+    await interaction.response.defer(ephemeral=True)
+
+    if nom in clans:
+        await interaction.followup.send(f"❌ Le clan **{nom}** existe déjà", ephemeral=True); return
+    if len(nom) > CONFIG["MAX_CLAN_NAME_LENGTH"]:
+        await interaction.followup.send(f"❌ Nom max {CONFIG['MAX_CLAN_NAME_LENGTH']} caractères", ephemeral=True); return
+
+    # Parse les membres
+    member_list = [m.strip() for m in membres.split(",") if m.strip()] if membres else []
+
+    # Vérifie que personne n'est déjà dans un autre clan
+    conflicts = []
+    all_to_add = [chef] + [m for m in member_list if m != chef]
+    for p in all_to_add:
+        if p in clan_members and clan_members[p] != nom:
+            conflicts.append(f"**{p}** est déjà dans **{clan_members[p]}**")
+    if conflicts:
+        msg_conflict = "❌ Conflits :\n" + "\n".join(conflicts)
+        await interaction.followup.send(msg_conflict, ephemeral=True); return
+
+    # Création du clan
+    clans[nom] = {"leader": chef, "created": datetime.now().isoformat(), "points": 0}
+
+    # Ajout chef + membres
+    added = []
+    for p in all_to_add:
+        clan_members[p] = nom
+        init_player(p)
+        added.append(p)
+
+    save_data()
+
+    e = discord.Embed(title=f"🛡️ Clan créé : {nom}", color=discord.Color.green())
+    e.add_field(name="👑 Chef",    value=chef,                inline=True)
+    e.add_field(name="👥 Membres", value=str(len(added)),     inline=True)
+    e.add_field(name="📋 Liste",   value="\n".join([f"{'👑' if p==chef else '•'} {p}" for p in added]) or "Aucun", inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
 
 # ── LOGS ──────────────────────────────────────
 
@@ -854,6 +949,60 @@ async def slash_addtime(interaction: discord.Interaction, joueur: str, minutes: 
     h_old = old/60; h_new = (old+minutes)/60
     await interaction.response.send_message(f"✅ **{joueur}** : {h_old:.1f}h → {h_new:.1f}h (+{minutes} min)", ephemeral=True)
 
+@tree.command(name="setupclan", description="Créer un clan complet d'un coup : nom, chef et membres (proprio)")
+async def slash_setupclan(
+    interaction: discord.Interaction,
+    nom: str,
+    chef: str,
+    membres: str  # noms séparés par des virgules, ex: "Alice,Bob,Charlie"
+):
+    """
+    Crée un clan avec nom, chef et membres en une seule commande.
+    Le chef est automatiquement inclus dans les membres.
+    membres = noms séparés par des virgules (sans espaces)
+    Ex: /setupclan nom:Warriors chef:Steve membres:Alex,Notch,Herobrine
+    """
+    if not await owner_check(interaction): return
+    await interaction.response.defer(ephemeral=True)
+
+    # Vérif nom
+    if nom in clans:
+        await interaction.followup.send(f"❌ Le clan **{nom}** existe déjà", ephemeral=True); return
+    if len(nom) > CONFIG["MAX_CLAN_NAME_LENGTH"]:
+        await interaction.followup.send(f"❌ Nom max {CONFIG['MAX_CLAN_NAME_LENGTH']} caractères", ephemeral=True); return
+
+    # Parse les membres
+    liste_membres = [m.strip() for m in membres.split(",") if m.strip()]
+    if chef not in liste_membres:
+        liste_membres.insert(0, chef)  # Le chef est toujours membre
+
+    # Vérifie les conflits de clan
+    conflits = [m for m in liste_membres if m in clan_members]
+    if conflits:
+        await interaction.followup.send(
+            f"❌ Ces joueurs sont déjà dans un clan : **{', '.join(conflits)}**\n"
+            f"Utilise `/removefromclan` d'abord.",
+            ephemeral=True
+        ); return
+
+    # Crée le clan
+    clans[nom] = {"leader": chef, "created": datetime.now().isoformat(), "points": 0}
+
+    # Ajoute tous les membres
+    for m in liste_membres:
+        init_player(m)
+        clan_members[m] = nom
+
+    save_data()
+
+    e = discord.Embed(title=f"🛡️ Clan créé : {nom}", color=discord.Color.green())
+    e.add_field(name="👑 Chef",    value=chef,                  inline=True)
+    e.add_field(name="👥 Membres", value=str(len(liste_membres)), inline=True)
+    e.add_field(name="📋 Liste",
+                value="\n".join([f"{'👑' if m == chef else '▸'} {m}" for m in liste_membres]),
+                inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
 @tree.command(name="setleader", description="Changer le chef d'un clan (proprio)")
 async def slash_setleader(interaction: discord.Interaction, clan: str, nouveau_chef: str):
     if not await owner_check(interaction): return
@@ -982,10 +1131,12 @@ async def slash_help(interaction: discord.Interaction):
     e1.add_field(name="/claninfo <nom>",               value="Infos d'un clan",             inline=True)
     e1.add_field(name="/clanleaderboard",              value="Classement des clans",        inline=True)
     e1.add_field(name="/transferleader <pseudo>",      value="Passer ton leadership",       inline=True)
+    e1.add_field(name="/setupclan <nom> <chef> <membres>", value="Créer clan complet (proprio)", inline=True)
 
     # ── Embed 2 : Admin ──
     e2 = discord.Embed(title="📖 Commandes Admin (2/2)", color=discord.Color.gold())
     e2.add_field(name="━━ 👑 ADMIN (proprio) ━━",      value="\u200b", inline=False)
+    e2.add_field(name="/setupclan <nom> <chef> <membres>", value="Créer un clan complet d'un coup",  inline=True)
     e2.add_field(name="/config",                       value="Voir la config du bot",        inline=True)
     e2.add_field(name="/setconfig <clé> <valeur>",     value="Modifier la config",           inline=True)
     e2.add_field(name="/listplayers",                  value="Tous les joueurs enregistrés", inline=True)
