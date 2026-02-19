@@ -3,215 +3,288 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import os
 from mcstatus import JavaServer
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import re
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = 715572086898294907
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+OWNER_ID   = 715572086898294907
 SERVER_ADDRESS = "lmanagil.aternos.me"
-ANNOUNCEMENT_CHANNEL_ID = 0
-LOGS_CHANNEL_ID = 0
-ACTIVE_ROLE_NAME = "Joueur Actif"
-HOURS_FOR_ACTIVE_ROLE = 10
-PREFIX = "!"
 
+# ══════════════════════════════════════════════
+#  CONFIG (modifiable avec /setconfig)
+# ══════════════════════════════════════════════
+CONFIG = {
+    "ANNOUNCEMENT_CHANNEL_ID": 0,
+    "LOGS_CHANNEL_ID":         0,
+    "ACTIVE_ROLE_NAME":        "Joueur Actif",
+    "HOURS_FOR_ACTIVE_ROLE":   10,
+    "POINTS_INTERCLAN_KILL":   10,
+    "POINTS_INTERCLAN_DEATH":  5,
+    "POINTS_PER_HOUR":         1,
+    "MAX_CLAN_NAME_LENGTH":    20,
+    "MAX_BOUNTY_POINTS":       1000,
+}
+
+DATA_DIR  = "./data"
+DATA_FILE = "./data/server_data.json"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+PREFIX = "!"
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+bot  = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 tree = bot.tree
 
-previous_status = None
-mc_server = None
-player_data = {}
-clans = {}
-clan_members = {}
-missions = {}
-achievements_data = {}
+previous_status      = None
+mc_server            = None
+player_data          = {}
+clans                = {}
+clan_members         = {}
+missions             = {}
+achievements_data    = {}
 current_session_players = {}
 
-DATA_FILE = "/tmp/server_data.json"
+# ══════════════════════════════════════════════
+#  SYSTÈME DE BOUNTY (PRIMES)
+# ══════════════════════════════════════════════
+# Structure : bounties[target] = {
+#   "proposer_clan": "NomClan",
+#   "proposed_by":   "NomJoueur",   ← qui a lancé la prime
+#   "points":        200,            ← points EN ESCROW (déjà retirés du clan)
+#   "created":       "2026-...",
+# }
+# Les points sont retirés du clan DÈS la création.
+# → Annulation : points rendus au clan proposeur
+# → Kill valide (autre clan) : points transférés au clan du killer
+# → Kill par le MÊME clan : bounty reste active, 0 reward (anti-farm)
+
+bounties = {}
+
+# ══════════════════════════════════════════════
+#  SAUVEGARDE / CHARGEMENT
+# ══════════════════════════════════════════════
 
 def load_data():
-    global player_data, clans, clan_members, missions, achievements_data
+    global player_data, clans, clan_members, missions, achievements_data, bounties
     try:
         with open(DATA_FILE, 'r') as f:
             data = json.load(f)
-            player_data = data.get("players", {})
-            clans = data.get("clans", {})
-            clan_members = data.get("clan_members", {})
-            missions = data.get("missions", {})
-            achievements_data = data.get("achievements", {})
-    except:
-        player_data = {}
-        clans = {}
-        clan_members = {}
-        missions = {}
-        achievements_data = {}
+        player_data       = data.get("players", {})
+        clans             = data.get("clans", {})
+        clan_members      = data.get("clan_members", {})
+        missions          = data.get("missions", {})
+        achievements_data = data.get("achievements", {})
+        bounties          = data.get("bounties", {})
+        # Charge aussi la config sauvegardée
+        saved_config = data.get("config", {})
+        for k, v in saved_config.items():
+            if k in CONFIG:
+                CONFIG[k] = v
+        print(f"[Data] Chargé : {len(player_data)} joueurs, {len(clans)} clans, {len(bounties)} primes actives")
+    except FileNotFoundError:
+        print("[Data] Nouveau fichier, démarrage vide")
+        player_data = {}; clans = {}; clan_members = {}
+        missions = {}; achievements_data = {}; bounties = {}
+    except Exception as e:
+        print(f"[Erreur] Chargement : {e}")
 
 def save_data():
     try:
-        data = {
-            "players": player_data,
-            "clans": clans,
-            "clan_members": clan_members,
-            "missions": missions,
-            "achievements": achievements_data
-        }
         with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump({
+                "players":      player_data,
+                "clans":        clans,
+                "clan_members": clan_members,
+                "missions":     missions,
+                "achievements": achievements_data,
+                "bounties":     bounties,
+                "config":       CONFIG,
+            }, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"[Erreur] Sauvegarde: {e}")
+        print(f"[Erreur] Sauvegarde : {e}")
 
-def init_player(player_name):
-    if player_name not in player_data:
-        player_data[player_name] = {
-            "total_minutes": 0,
-            "sessions": 0,
-            "kills": 0,
-            "deaths": 0,
-            "zombie_kills": 0,
-            "distance": 0,
+# ══════════════════════════════════════════════
+#  GESTION JOUEURS
+# ══════════════════════════════════════════════
+
+def init_player(name):
+    if name not in player_data:
+        player_data[name] = {
+            "total_minutes": 0, "sessions": 0,
+            "kills": 0, "deaths": 0,
+            "zombie_kills": 0, "clan_kills": 0,
             "last_seen": None,
             "first_seen": datetime.now().isoformat(),
-            "achievements": []
+            "achievements": [],
+            "rivals": {}       # {adversaire: {kills: X, deaths: Y}}
         }
 
+def update_playtime(name, minutes):
+    init_player(name)
+    player_data[name]["total_minutes"] += minutes
+    player_data[name]["sessions"]      += 1
+    player_data[name]["last_seen"]      = datetime.now().isoformat()
+    # Points par heure pour le clan
+    if name in clan_members:
+        cn = clan_members[name]
+        if cn in clans:
+            pts = int(minutes / 60) * CONFIG["POINTS_PER_HOUR"]
+            if pts > 0:
+                clans[cn]["points"] += pts
+    if player_data[name]["total_minutes"] >= CONFIG["HOURS_FOR_ACTIVE_ROLE"] * 60:
+        check_achievement(name, "survivor_10h")
+    save_data()
+
+def record_rivalry(killer, victim):
+    player_data[killer].setdefault("rivals", {})
+    player_data[killer]["rivals"].setdefault(victim, {"kills": 0, "deaths": 0})
+    player_data[killer]["rivals"][victim]["kills"] += 1
+
+    player_data[victim].setdefault("rivals", {})
+    player_data[victim]["rivals"].setdefault(killer, {"kills": 0, "deaths": 0})
+    player_data[victim]["rivals"][killer]["deaths"] += 1
+
+# ══════════════════════════════════════════════
+#  ACHIEVEMENTS
+# ══════════════════════════════════════════════
+
+ACHIEVEMENTS = {
+    "first_blood":   {"name": "🩸 Premier Sang",        "desc": "1er kill PvP",                           "points": 50},
+    "survivor_10h":  {"name": "🏆 Survivant",           "desc": "10h de jeu cumulées",                   "points": 100},
+    "zombie_hunter": {"name": "🧟 Chasseur de Zombies", "desc": "100 zombies tués",                      "points": 200},
+    "pvp_master":    {"name": "⚔️ Maître PvP",          "desc": "50 kills PvP",                          "points": 300},
+    "clan_warrior":  {"name": "🛡️ Guerrier de Clan",   "desc": "10 kills inter-clans",                  "points": 150},
+    "nemesis":       {"name": "😈 Nemesis",              "desc": "Tuer le même joueur 5 fois",            "points": 100},
+    "comeback":      {"name": "🔥 Comeback",             "desc": "Tuer quelqu'un qui t'avait tué 3+ fois","points": 125},
+    "bounty_hunter": {"name": "💰 Chasseur de Primes",  "desc": "Récupérer une prime",                   "points":  75},
+}
+
+def check_achievement(player, ach_id, extra=None):
+    if ach_id not in ACHIEVEMENTS or player not in player_data: return False
+    if ach_id in player_data[player].get("achievements", []):   return False
+    d = player_data[player]
+    earned = False
+    if   ach_id == "first_blood"   and d["kills"] >= 1:                                        earned = True
+    elif ach_id == "survivor_10h"  and d["total_minutes"] >= CONFIG["HOURS_FOR_ACTIVE_ROLE"]*60: earned = True
+    elif ach_id == "zombie_hunter" and d["zombie_kills"] >= 100:                               earned = True
+    elif ach_id == "pvp_master"    and d["kills"] >= 50:                                       earned = True
+    elif ach_id == "clan_warrior"  and d.get("clan_kills", 0) >= 10:                           earned = True
+    elif ach_id == "nemesis"       and extra and d.get("rivals", {}).get(extra, {}).get("kills", 0) >= 5: earned = True
+    elif ach_id == "comeback"      and extra and d.get("rivals", {}).get(extra, {}).get("deaths", 0) >= 3: earned = True
+    elif ach_id == "bounty_hunter":                                                            earned = True
+
+    if earned:
+        player_data[player].setdefault("achievements", []).append(ach_id)
+        if player in clan_members:
+            cn = clan_members[player]
+            if cn in clans:
+                clans[cn]["points"] += ACHIEVEMENTS[ach_id]["points"]
+        save_data()
+        return ACHIEVEMENTS[ach_id]
+    return False
+
+# ══════════════════════════════════════════════
+#  PARSING LOGS MINECRAFT
+# ══════════════════════════════════════════════
+
 def parse_minecraft_logs(log_content):
-    events = []
-    
-    # Patterns pour extraire les événements
+    events   = []
     patterns = {
-        "join": r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+joined the game",
-        "leave": r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+left the game",
-        "pvp_kill": r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+was (?:slain|killed) by (\w+)",
+        "join":         r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+joined the game",
+        "leave":        r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+left the game",
+        "pvp_kill":     r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+was (?:slain|killed) by (\w+)",
         "zombie_death": r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+was (?:slain|killed) by (?:Zombie|zombie)",
-        "fall_death": r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+(?:fell|died)",
+        "fall_death":   r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+(?:fell|died)",
     }
-    
     for line in log_content.split('\n'):
-        # Connexions
-        match = re.search(patterns["join"], line)
-        if match:
-            events.append({"type": "join", "time": match.group(1), "player": match.group(2)})
-            continue
-        
-        # Déconnexions
-        match = re.search(patterns["leave"], line)
-        if match:
-            events.append({"type": "leave", "time": match.group(1), "player": match.group(2)})
-            continue
-        
-        # Kills PvP
-        match = re.search(patterns["pvp_kill"], line)
-        if match:
-            events.append({
-                "type": "pvp_kill",
-                "time": match.group(1),
-                "victim": match.group(2),
-                "killer": match.group(3)
-            })
-            continue
-        
-        # Mort par zombie
-        match = re.search(patterns["zombie_death"], line)
-        if match:
-            events.append({"type": "zombie_death", "time": match.group(1), "player": match.group(2)})
-            continue
-        
-        # Mort par chute/autre
-        match = re.search(patterns["fall_death"], line)
-        if match:
-            events.append({"type": "other_death", "time": match.group(1), "player": match.group(2)})
-    
+        for etype, pat in patterns.items():
+            m = re.search(pat, line)
+            if m:
+                if etype == "pvp_kill":
+                    events.append({"type": etype, "time": m.group(1), "victim": m.group(2), "killer": m.group(3)})
+                else:
+                    events.append({"type": etype, "time": m.group(1), "player": m.group(2)})
+                break
     return events
 
+def process_kill(killer, victim, summary_kills):
+    """Traite un kill PvP : stats, rivalités, points clans, bounties, achievements."""
+    init_player(killer)
+    init_player(victim)
+
+    # Vérifie comeback AVANT d'enregistrer
+    deaths_before = player_data[killer].get("rivals", {}).get(victim, {}).get("deaths", 0)
+
+    player_data[killer]["kills"]  += 1
+    player_data[victim]["deaths"] += 1
+    summary_kills.append(f"{killer} → {victim}")
+
+    record_rivalry(killer, victim)
+
+    killer_clan = clan_members.get(killer)
+    victim_clan = clan_members.get(victim)
+
+    # ── Points inter-clans ──
+    if killer_clan and victim_clan and killer_clan != victim_clan:
+        clans[killer_clan]["points"] += CONFIG["POINTS_INTERCLAN_KILL"]
+        clans[victim_clan]["points"]  = max(0, clans[victim_clan]["points"] - CONFIG["POINTS_INTERCLAN_DEATH"])
+        player_data[killer]["clan_kills"] = player_data[killer].get("clan_kills", 0) + 1
+        check_achievement(killer, "clan_warrior")
+
+    # ── BOUNTIES ──
+    # Si la victime a une prime sur la tête
+    if victim in bounties:
+        b = bounties[victim]
+        proposer_clan = b["proposer_clan"]
+        bounty_pts    = b["points"]
+
+        # ✅ Anti-farm : le clan qui a posé la prime ne peut pas la récupérer lui-même
+        if killer_clan and killer_clan != proposer_clan:
+            # Prime récupérée ! Transfert des points vers le clan du killer
+            if killer_clan in clans:
+                clans[killer_clan]["points"] += bounty_pts
+            del bounties[victim]
+            save_data()
+            check_achievement(killer, "bounty_hunter")
+            print(f"[Bounty] {killer} ({killer_clan}) a récupéré la prime sur {victim} : +{bounty_pts} pts")
+        else:
+            # Même clan ou killer sans clan → prime reste active, aucun reward
+            print(f"[Bounty] Kill ignoré pour la prime : {killer} est du même clan que le proposeur ({proposer_clan})")
+
+    # ── Achievements ──
+    if player_data[killer]["kills"] == 1: check_achievement(killer, "first_blood")
+    if player_data[killer]["kills"] >= 50: check_achievement(killer, "pvp_master")
+    check_achievement(killer, "nemesis",  extra=victim)
+    if deaths_before >= 3: check_achievement(killer, "comeback", extra=victim)
+
 def process_events(events):
-    summary = {
-        "joins": [],
-        "kills": [],
-        "deaths": [],
-        "zombie_deaths": []
-    }
-    
+    summary = {"joins": [], "kills": [], "deaths": [], "zombie_deaths": []}
     for event in events:
         if event["type"] == "join":
             summary["joins"].append(event["player"])
-        
         elif event["type"] == "pvp_kill":
-            killer = event["killer"]
-            victim = event["victim"]
-            
-            init_player(killer)
-            init_player(victim)
-            
-            player_data[killer]["kills"] += 1
-            player_data[victim]["deaths"] += 1
-            
-            summary["kills"].append(f"{killer} → {victim}")
-            
-            # Achievement: Premier sang
-            if player_data[killer]["kills"] == 1:
-                check_achievement(killer, "first_blood")
-        
-        elif event["type"] in ["zombie_death", "other_death"]:
-            player = event["player"]
-            init_player(player)
-            player_data[player]["deaths"] += 1
-            summary["deaths"].append(player)
-    
+            process_kill(event["killer"], event["victim"], summary["kills"])
+        elif event["type"] == "zombie_death":
+            p = event["player"]; init_player(p)
+            player_data[p]["deaths"]      += 1
+            player_data[p]["zombie_kills"] = player_data[p].get("zombie_kills", 0) + 1
+            summary["zombie_deaths"].append(p)
+            if player_data[p]["zombie_kills"] >= 100: check_achievement(p, "zombie_hunter")
+        elif event["type"] == "fall_death":
+            p = event["player"]; init_player(p)
+            player_data[p]["deaths"] += 1
+            summary["deaths"].append(p)
     save_data()
     return summary
 
-def check_achievement(player, achievement_id):
-    achievements = {
-        "first_blood": {"name": "🩸 Premier Sang", "desc": "Premier kill PvP", "points": 50},
-        "survivor_10h": {"name": "🏆 Survivant", "desc": "10h de jeu", "points": 100},
-        "zombie_hunter": {"name": "🧟 Chasseur de Zombies", "desc": "100 zombies tués", "points": 200},
-        "pvp_master": {"name": "⚔️ Maître PvP", "desc": "50 kills PvP", "points": 300},
-    }
-    
-    if achievement_id not in achievements:
-        return False
-    
-    if player not in player_data:
-        return False
-    
-    if achievement_id in player_data[player].get("achievements", []):
-        return False
-    
-    # Vérifier conditions
-    ach = achievements[achievement_id]
-    earned = False
-    
-    if achievement_id == "first_blood" and player_data[player]["kills"] >= 1:
-        earned = True
-    elif achievement_id == "survivor_10h" and player_data[player]["total_minutes"] >= 600:
-        earned = True
-    elif achievement_id == "zombie_hunter" and player_data[player]["zombie_kills"] >= 100:
-        earned = True
-    elif achievement_id == "pvp_master" and player_data[player]["kills"] >= 50:
-        earned = True
-    
-    if earned:
-        if "achievements" not in player_data[player]:
-            player_data[player]["achievements"] = []
-        player_data[player]["achievements"].append(achievement_id)
-        
-        # Ajouter points au clan si le joueur en a un
-        if player in clan_members:
-            clan_name = clan_members[player]
-            if clan_name in clans:
-                clans[clan_name]["points"] += ach["points"]
-        
-        save_data()
-        return ach
-    
-    return False
+# ══════════════════════════════════════════════
+#  SERVEUR MC
+# ══════════════════════════════════════════════
 
 def check_server_status():
     global mc_server
@@ -219,352 +292,761 @@ def check_server_status():
         if mc_server is None:
             mc_server = JavaServer.lookup(SERVER_ADDRESS)
         status = mc_server.status()
-        query = mc_server.query()
-        return {
-            "online": True,
-            "players": status.players.online,
-            "max_players": status.players.max,
-            "version": status.version.name,
-            "latency": round(status.latency, 1),
-            "player_list": query.players.names if query.players.names else []
-        }
-    except Exception:
+        try:
+            query       = mc_server.query()
+            player_list = query.players.names if query.players.names else []
+        except:
+            player_list = []
+        return {"online": True, "players": status.players.online,
+                "max_players": status.players.max, "version": status.version.name,
+                "latency": round(status.latency, 1), "player_list": player_list}
+    except:
         return {"online": False, "player_list": []}
 
-def update_playtime(player_name, minutes):
-    init_player(player_name)
-    player_data[player_name]["total_minutes"] += minutes
-    player_data[player_name]["sessions"] += 1
-    player_data[player_name]["last_seen"] = datetime.now().isoformat()
-    
-    # Check achievements
-    if player_data[player_name]["total_minutes"] >= 600:
-        check_achievement(player_name, "survivor_10h")
-    
-    save_data()
-
 async def check_and_give_role(guild, player_name):
-    if player_name not in player_data:
-        return
-    
-    total_hours = player_data[player_name]["total_minutes"] / 60
-    
-    if total_hours >= HOURS_FOR_ACTIVE_ROLE:
-        role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
-        
-        if not role:
-            try:
-                role = await guild.create_role(
-                    name=ACTIVE_ROLE_NAME,
-                    color=discord.Color.gold(),
-                    reason="Rôle automatique"
-                )
-            except:
-                return
-        
-        for member in guild.members:
-            if member.nick == player_name or member.name == player_name or member.display_name == player_name:
-                if role not in member.roles:
-                    try:
-                        await member.add_roles(role)
-                    except:
-                        pass
-                break
+    if player_name not in player_data: return
+    if player_data[player_name]["total_minutes"] / 60 < CONFIG["HOURS_FOR_ACTIVE_ROLE"]: return
+    role_name = CONFIG["ACTIVE_ROLE_NAME"]
+    role = discord.utils.get(guild.roles, name=role_name)
+    if not role:
+        try:
+            role = await guild.create_role(name=role_name, color=discord.Color.gold(), reason="Rôle auto MC")
+        except Exception as e:
+            print(f"[Erreur] Création rôle : {e}"); return
+    for member in guild.members:
+        if member.nick == player_name or member.name == player_name or member.display_name == player_name:
+            if role not in member.roles:
+                try:
+                    await member.add_roles(role)
+                    print(f"[Rôle] {player_name} → '{role_name}'")
+                except Exception as e:
+                    print(f"[Erreur] Ajout rôle : {e}")
+            break
+
+# ══════════════════════════════════════════════
+#  EVENTS BOT
+# ══════════════════════════════════════════════
 
 @bot.event
 async def on_ready():
     print(f"[Bot] {bot.user} connecté")
     load_data()
     synced = await tree.sync()
-    print(f"[Bot] {len(synced)} commandes sync")
+    print(f"[Bot] {len(synced)} commandes synchronisées")
     server_monitor.start()
 
 @tasks.loop(minutes=3)
 async def server_monitor():
     global previous_status, current_session_players
-    
-    status = check_server_status()
-    current_online = status["online"]
-    
-    if current_online:
-        activity = discord.Game(name=f"🟢 {status['players']}/{status['max_players']} joueurs")
-        
-        for player in status["player_list"]:
-            if player not in current_session_players:
-                current_session_players[player] = datetime.now()
-                
-                # Log connexion
-                if LOGS_CHANNEL_ID != 0:
-                    channel = bot.get_channel(LOGS_CHANNEL_ID)
-                    if channel:
-                        await channel.send(f"🟢 **{player}** s'est connecté")
-        
-        players_to_remove = []
-        for player in current_session_players:
-            if player not in status["player_list"]:
-                session_duration = (datetime.now() - current_session_players[player]).total_seconds() / 60
-                update_playtime(player, session_duration)
-                players_to_remove.append(player)
-                
-                # Log déconnexion
-                if LOGS_CHANNEL_ID != 0:
-                    channel = bot.get_channel(LOGS_CHANNEL_ID)
-                    if channel:
-                        await channel.send(f"🔴 **{player}** s'est déconnecté")
-                
-                for guild in bot.guilds:
-                    await check_and_give_role(guild, player)
-        
-        for player in players_to_remove:
-            del current_session_players[player]
-    else:
-        activity = discord.Game(name="🔴 Hors ligne")
-        
-        for player, join_time in current_session_players.items():
-            session_duration = (datetime.now() - join_time).total_seconds() / 60
-            update_playtime(player, session_duration)
-        current_session_players.clear()
-    
-    await bot.change_presence(activity=activity)
-    
-    if previous_status is not None and previous_status != current_online:
-        if ANNOUNCEMENT_CHANNEL_ID != 0:
-            channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-            if channel:
-                if current_online:
-                    embed = discord.Embed(
-                        title="🟢 Serveur en ligne !",
-                        description=f"@everyone **{SERVER_ADDRESS}** est accessible !",
-                        color=discord.Color.green()
-                    )
-                    await channel.send("@everyone", embed=embed)
-                else:
-                    embed = discord.Embed(
-                        title="🔴 Serveur hors ligne",
-                        color=discord.Color.red()
-                    )
-                    await channel.send(embed=embed)
-    
-    previous_status = current_online
+    s = check_server_status()
+    online = s["online"]
 
-async def owner_check(ctx_or_interaction) -> bool:
-    if isinstance(ctx_or_interaction, discord.Interaction):
-        uid = ctx_or_interaction.user.id
-        async def deny():
-            await ctx_or_interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
+    if online:
+        await bot.change_presence(activity=discord.Game(name=f"🟢 {s['players']}/{s['max_players']} joueurs"))
+        for p in s["player_list"]:
+            if p not in current_session_players:
+                current_session_players[p] = datetime.now()
+                ch_id = CONFIG["LOGS_CHANNEL_ID"]
+                if ch_id:
+                    ch = bot.get_channel(ch_id)
+                    if ch: await ch.send(f"🟢 **{p}** s'est connecté")
+        for p in list(current_session_players):
+            if p not in s["player_list"]:
+                mins = (datetime.now() - current_session_players[p]).total_seconds() / 60
+                update_playtime(p, mins)
+                del current_session_players[p]
+                ch_id = CONFIG["LOGS_CHANNEL_ID"]
+                if ch_id:
+                    ch = bot.get_channel(ch_id)
+                    if ch: await ch.send(f"🔴 **{p}** déconnecté ({int(mins)} min)")
+                for guild in bot.guilds:
+                    await check_and_give_role(guild, p)
     else:
-        uid = ctx_or_interaction.author.id
-        async def deny():
-            await ctx_or_interaction.send("❌ Accès refusé.")
-    if uid != OWNER_ID:
-        await deny()
+        await bot.change_presence(activity=discord.Game(name="🔴 Serveur hors ligne"))
+        for p, t in current_session_players.items():
+            update_playtime(p, (datetime.now() - t).total_seconds() / 60)
+        current_session_players.clear()
+
+    if previous_status is not None and previous_status != online:
+        ch_id = CONFIG["ANNOUNCEMENT_CHANNEL_ID"]
+        if ch_id:
+            ch = bot.get_channel(ch_id)
+            if ch:
+                if online:
+                    e = discord.Embed(title="🟢 Serveur en ligne !", description=f"**{SERVER_ADDRESS}** est accessible !", color=discord.Color.green())
+                    await ch.send("@everyone", embed=e)
+                else:
+                    await ch.send(embed=discord.Embed(title="🔴 Serveur hors ligne", color=discord.Color.red()))
+    previous_status = online
+
+async def owner_check(interaction) -> bool:
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Accès refusé — commande réservée au proprio.", ephemeral=True)
         return False
     return True
 
-@tree.command(name="uploadlogs", description="Uploader les logs du serveur (proprio)")
-async def slash_uploadlogs(interaction: discord.Interaction, fichier: discord.Attachment):
-    if not await owner_check(interaction):
-        return
-    
+def is_clan_leader(player_name, clan_name):
+    return clans.get(clan_name, {}).get("leader") == player_name
+
+# ══════════════════════════════════════════════
+#  ═══════ COMMANDES SLASH ═══════
+# ══════════════════════════════════════════════
+
+# ── SERVEUR & STATS ───────────────────────────
+
+@tree.command(name="status", description="Statut du serveur Minecraft")
+async def slash_status(interaction: discord.Interaction):
     await interaction.response.defer()
-    
-    if not fichier.filename.endswith('.log') and not fichier.filename.endswith('.txt'):
-        await interaction.followup.send("❌ Le fichier doit être un .log ou .txt")
-        return
-    
-    try:
-        log_content = await fichier.read()
-        log_text = log_content.decode('utf-8', errors='ignore')
-        
-        events = parse_minecraft_logs(log_text)
-        summary = process_events(events)
-        
-        embed = discord.Embed(title="📊 Logs analysés", color=discord.Color.blue())
-        embed.add_field(name="Connexions", value=str(len(summary["joins"])), inline=True)
-        embed.add_field(name="Kills PvP", value=str(len(summary["kills"])), inline=True)
-        embed.add_field(name="Morts", value=str(len(summary["deaths"])), inline=True)
-        
-        if summary["kills"]:
-            kills_text = "\n".join(summary["kills"][:10])
-            embed.add_field(name="🔪 Kills récents", value=kills_text, inline=False)
-        
-        await interaction.followup.send(embed=embed)
-        
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erreur : {e}")
+    s = check_server_status()
+    if s["online"]:
+        e = discord.Embed(title=f"🎮 {SERVER_ADDRESS}", color=discord.Color.green())
+        e.add_field(name="Statut",  value="🟢 En ligne",                               inline=True)
+        e.add_field(name="Joueurs", value=f"{s['players']}/{s['max_players']}",        inline=True)
+        e.add_field(name="Ping",    value=f"{s['latency']}ms",                        inline=True)
+        e.add_field(name="🎮 En ligne", value=", ".join(s["player_list"]) or "Personne", inline=False)
+    else:
+        e = discord.Embed(title=f"🎮 {SERVER_ADDRESS}",
+                          description="🔴 Hors ligne\n*(Sur Aternos, démarre-le manuellement)*",
+                          color=discord.Color.red())
+    await interaction.followup.send(embed=e)
+
+@tree.command(name="stats", description="Stats complètes d'un joueur")
+async def slash_stats(interaction: discord.Interaction, joueur: str):
+    await interaction.response.defer()
+    if joueur not in player_data:
+        await interaction.followup.send(f"❌ Aucune donnée pour **{joueur}**"); return
+    d     = player_data[joueur]
+    hours = d["total_minutes"] / 60
+    ratio = d["kills"] / d["deaths"] if d["deaths"] > 0 else float(d["kills"])
+
+    e = discord.Embed(title=f"📊 Stats de {joueur}", color=discord.Color.blue())
+    e.add_field(name="⏱️ Temps de jeu",      value=f"{hours:.1f}h",                   inline=True)
+    e.add_field(name="🎮 Sessions",           value=str(d["sessions"]),                inline=True)
+    e.add_field(name="🛡️ Clan",              value=clan_members.get(joueur,"Aucun"),  inline=True)
+    e.add_field(name="⚔️ Kills PvP",         value=str(d["kills"]),                   inline=True)
+    e.add_field(name="☠️ Morts",             value=str(d["deaths"]),                  inline=True)
+    e.add_field(name="📊 K/D",               value=f"{ratio:.2f}",                   inline=True)
+    e.add_field(name="🧟 Zombies",           value=str(d.get("zombie_kills",0)),      inline=True)
+    e.add_field(name="🛡️ Kills inter-clan", value=str(d.get("clan_kills",0)),        inline=True)
+
+    # Bounty active ?
+    if joueur in bounties:
+        b = bounties[joueur]
+        e.add_field(name="💰 Prime active !", value=f"{b['points']} pts — posée par [{b['proposer_clan']}]", inline=False)
+
+    rivals = d.get("rivals", {})
+    if rivals:
+        tk = sorted([(r,v) for r,v in rivals.items() if v["kills"]>0],  key=lambda x:x[1]["kills"],  reverse=True)[:3]
+        td = sorted([(r,v) for r,v in rivals.items() if v["deaths"]>0], key=lambda x:x[1]["deaths"], reverse=True)[:3]
+        if tk: e.add_field(name="🔪 Victimes préférées",    value="\n".join([f"**{r}** : {v['kills']}x"  for r,v in tk]), inline=True)
+        if td: e.add_field(name="😵 Te tue le plus souvent",value="\n".join([f"**{r}** : {v['deaths']}x" for r,v in td]), inline=True)
+
+    achs = d.get("achievements", [])
+    if achs:
+        e.add_field(name=f"🏆 Achievements ({len(achs)})", value="\n".join([ACHIEVEMENTS[a]["name"] for a in achs if a in ACHIEVEMENTS]), inline=False)
+    await interaction.followup.send(embed=e)
+
+@tree.command(name="rivalry", description="Historique de kills entre deux joueurs")
+async def slash_rivalry(interaction: discord.Interaction, joueur1: str, joueur2: str):
+    await interaction.response.defer()
+    if joueur1 not in player_data or joueur2 not in player_data:
+        await interaction.followup.send("❌ L'un des deux joueurs n'a pas de données"); return
+    r1 = player_data[joueur1].get("rivals", {}).get(joueur2, {"kills":0,"deaths":0})
+    r2 = player_data[joueur2].get("rivals", {}).get(joueur1, {"kills":0,"deaths":0})
+    j1k = r1["kills"]; j2k = r2["kills"]; total = j1k + j2k
+
+    e = discord.Embed(title=f"⚔️ {joueur1} vs {joueur2}", color=discord.Color.red())
+    if total > 0:
+        p1  = int((j1k/total)*10)
+        bar = "🟥"*p1 + "🟦"*(10-p1)
+        e.add_field(name=f"📊 {joueur1} ←→ {joueur2}", value=bar, inline=False)
+    e.add_field(name=f"💀 {joueur1} → {joueur2}", value=f"**{j1k}** kills", inline=True)
+    e.add_field(name=f"💀 {joueur2} → {joueur1}", value=f"**{j2k}** kills", inline=True)
+    e.add_field(name="🎯 Total",                  value=str(total),         inline=True)
+    if j1k > j2k:   e.add_field(name="👑 Dominant", value=f"**{joueur1}** domine (+{j1k-j2k})", inline=False)
+    elif j2k > j1k: e.add_field(name="👑 Dominant", value=f"**{joueur2}** domine (+{j2k-j1k})", inline=False)
+    else:            e.add_field(name="🤝",          value="Égalité parfaite",                   inline=False)
+    await interaction.followup.send(embed=e)
+
+@tree.command(name="myrivalry", description="Tes stats contre un adversaire précis")
+async def slash_myrivalry(interaction: discord.Interaction, adversaire: str):
+    await interaction.response.defer()
+    joueur = interaction.user.display_name
+    if joueur not in player_data:
+        await interaction.followup.send(f"❌ Aucune donnée pour toi ({joueur})"); return
+    if adversaire not in player_data:
+        await interaction.followup.send(f"❌ **{adversaire}** n'a pas de données"); return
+    r = player_data[joueur].get("rivals",{}).get(adversaire,{"kills":0,"deaths":0})
+    k = r["kills"]; d = r["deaths"]; total = k+d
+    ratio = k/d if d>0 else float(k)
+    if k>d:   desc, color = f"✅ Tu **domines** {adversaire} !", discord.Color.green()
+    elif d>k: desc, color = f"❌ **{adversaire}** te domine...", discord.Color.red()
+    else:     desc, color = f"🤝 Égalité avec {adversaire}", discord.Color.orange()
+    e = discord.Embed(title=f"⚔️ Toi vs {adversaire}", description=desc, color=color)
+    e.add_field(name="💀 Fois que tu l'as tué",    value=str(k),          inline=True)
+    e.add_field(name="☠️ Fois qu'il t'a tué",     value=str(d),          inline=True)
+    e.add_field(name="📊 Ratio vs lui",             value=f"{ratio:.2f}", inline=True)
+    e.add_field(name="🎯 Total affrontements",      value=str(total),     inline=True)
+    await interaction.followup.send(embed=e)
 
 @tree.command(name="pvpleaderboard", description="Classement PvP")
 async def slash_pvpleaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
-    
-    pvp_players = [(name, data) for name, data in player_data.items() if data.get("kills", 0) > 0]
-    pvp_players.sort(key=lambda x: x[1]["kills"], reverse=True)
-    
-    if not pvp_players:
-        await interaction.followup.send("❌ Aucune donnée PvP disponible")
-        return
-    
-    embed = discord.Embed(title="⚔️ Classement PvP", color=discord.Color.red())
-    
-    for i, (player, data) in enumerate(pvp_players[:10]):
-        kills = data.get("kills", 0)
-        deaths = data.get("deaths", 0)
-        ratio = kills / deaths if deaths > 0 else kills
-        
-        medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
-        embed.add_field(
-            name=f"{medal} {player}",
-            value=f"💀 {kills} kills • ☠️ {deaths} morts • 📊 Ratio: {ratio:.2f}",
+    pvp = sorted([(n,d) for n,d in player_data.items() if d.get("kills",0)>0], key=lambda x:x[1]["kills"], reverse=True)
+    if not pvp:
+        await interaction.followup.send("❌ Aucune donnée PvP"); return
+    e = discord.Embed(title="⚔️ Classement PvP", color=discord.Color.red())
+    for i,(player,d) in enumerate(pvp[:10]):
+        k=d.get("kills",0); dth=d.get("deaths",0); ratio=k/dth if dth>0 else float(k)
+        tag=f" [{clan_members[player]}]" if player in clan_members else ""
+        medal=["🥇","🥈","🥉"][i] if i<3 else f"{i+1}."
+        e.add_field(name=f"{medal} {player}{tag}", value=f"💀 {k} kills • ☠️ {dth} morts • K/D: {ratio:.2f}", inline=False)
+    await interaction.followup.send(embed=e)
+
+@tree.command(name="top", description="Classement par temps de jeu")
+async def slash_top(interaction: discord.Interaction):
+    await interaction.response.defer()
+    if not player_data:
+        await interaction.followup.send("❌ Aucune donnée"); return
+    sp = sorted(player_data.items(), key=lambda x:x[1]["total_minutes"], reverse=True)
+    e  = discord.Embed(title="⏱️ Classement Temps de Jeu", color=discord.Color.blurple())
+    for i,(player,d) in enumerate(sp[:10]):
+        h=d["total_minutes"]/60; tag=f" [{clan_members[player]}]" if player in clan_members else ""
+        medal=["🥇","🥈","🥉"][i] if i<3 else f"{i+1}."
+        e.add_field(name=f"{medal} {player}{tag}", value=f"⏱️ {h:.1f}h • 🎮 {d['sessions']} sessions", inline=False)
+    await interaction.followup.send(embed=e)
+
+# ── BOUNTIES (PRIMES) ─────────────────────────
+
+@tree.command(name="bounty", description="Poser une prime sur un joueur ennemi")
+async def slash_bounty(interaction: discord.Interaction, cible: str, points: int):
+    """
+    Pose une prime sur 'cible'.
+    - Les points sont retirés IMMÉDIATEMENT du clan proposeur (escrow)
+    - Si annulée → points rendus
+    - Si quelqu'un d'un AUTRE clan tue la cible → points transférés
+    - Si un membre du MÊME clan tue la cible → bounty reste active (anti-farm)
+    """
+    await interaction.response.defer()
+    player_name = interaction.user.display_name
+
+    if player_name not in clan_members:
+        await interaction.followup.send("❌ Tu dois être dans un clan pour poser une prime"); return
+
+    clan_name = clan_members[player_name]
+
+    if not is_clan_leader(player_name, clan_name):
+        await interaction.followup.send("❌ Seul le chef de clan peut poser une prime"); return
+
+    if points <= 0:
+        await interaction.followup.send("❌ Les points doivent être positifs"); return
+
+    if points > CONFIG["MAX_BOUNTY_POINTS"]:
+        await interaction.followup.send(f"❌ Maximum {CONFIG['MAX_BOUNTY_POINTS']} points par prime"); return
+
+    if clans[clan_name]["points"] < points:
+        await interaction.followup.send(f"❌ Ton clan n'a que **{clans[clan_name]['points']}** points, pas assez pour cette prime"); return
+
+    # Vérif cible
+    if cible not in player_data:
+        await interaction.followup.send(f"❌ **{cible}** n'a jamais joué sur le serveur"); return
+
+    # Vérif : pas une prime sur un membre de son propre clan
+    if clan_members.get(cible) == clan_name:
+        await interaction.followup.send("❌ Tu ne peux pas mettre une prime sur un membre de TON clan"); return
+
+    if cible in bounties:
+        await interaction.followup.send(f"❌ **{cible}** a déjà une prime active ({bounties[cible]['points']} pts)"); return
+
+    # Retrait immédiat des points (escrow)
+    clans[clan_name]["points"] -= points
+    bounties[cible] = {
+        "proposer_clan": clan_name,
+        "proposed_by":   player_name,
+        "points":        points,
+        "created":       datetime.now().isoformat(),
+    }
+    save_data()
+
+    e = discord.Embed(title="💰 Prime posée !", color=discord.Color.gold())
+    e.add_field(name="🎯 Cible",     value=cible,                             inline=True)
+    e.add_field(name="💰 Récompense",value=f"{points} pts",                  inline=True)
+    e.add_field(name="📤 Proposé par",value=f"{player_name} [{clan_name}]",  inline=True)
+    e.add_field(name="ℹ️ Info",      value=f"Les {points} pts ont été retirés de **{clan_name}**. Ils seront rendus si la prime est annulée.", inline=False)
+    e.set_footer(text="⚠️ Un membre du même clan ne peut pas récupérer la prime (anti-farm)")
+    await interaction.followup.send(embed=e)
+
+@tree.command(name="cancelbounty", description="Annuler une prime et récupérer les points")
+async def slash_cancelbounty(interaction: discord.Interaction, cible: str):
+    """
+    Annule la prime sur 'cible' et rend les points au clan proposeur.
+    Seul le chef du clan proposeur ou le proprio peut annuler.
+    """
+    await interaction.response.defer()
+    player_name = interaction.user.display_name
+
+    if cible not in bounties:
+        await interaction.followup.send(f"❌ Aucune prime active sur **{cible}**"); return
+
+    b = bounties[cible]
+    # Vérifie les droits : proprio OU chef du clan qui a posé la prime
+    is_owner    = interaction.user.id == OWNER_ID
+    is_proposer = (player_name in clan_members
+                   and clan_members[player_name] == b["proposer_clan"]
+                   and is_clan_leader(player_name, b["proposer_clan"]))
+
+    if not is_owner and not is_proposer:
+        await interaction.followup.send("❌ Seul le chef du clan proposeur ou le proprio peut annuler cette prime"); return
+
+    # Retour des points
+    pts  = b["points"]
+    clan = b["proposer_clan"]
+    if clan in clans:
+        clans[clan]["points"] += pts
+    del bounties[cible]
+    save_data()
+
+    await interaction.followup.send(f"✅ Prime sur **{cible}** annulée. **{pts} pts** rendus au clan **{clan}**.")
+
+@tree.command(name="bounties", description="Voir toutes les primes actives")
+async def slash_bounties(interaction: discord.Interaction):
+    await interaction.response.defer()
+    if not bounties:
+        await interaction.followup.send("✅ Aucune prime active en ce moment"); return
+    e = discord.Embed(title="💰 Primes Actives", color=discord.Color.gold())
+    for target, b in bounties.items():
+        created = datetime.fromisoformat(b["created"]).strftime("%d/%m %H:%M")
+        e.add_field(
+            name=f"🎯 {target}",
+            value=f"💰 **{b['points']} pts** • Posée par **{b['proposed_by']}** [{b['proposer_clan']}] le {created}",
             inline=False
         )
-    
-    await interaction.followup.send(embed=embed)
+    e.set_footer(text="⚠️ Un membre du clan proposeur ne peut pas récupérer sa propre prime")
+    await interaction.followup.send(embed=e)
 
-@tree.command(name="stats", description="Voir les stats d'un joueur")
-async def slash_stats(interaction: discord.Interaction, joueur: str):
-    await interaction.response.defer()
-    
-    if joueur not in player_data:
-        await interaction.followup.send(f"❌ Aucune donnée pour **{joueur}**")
-        return
-    
-    data = player_data[joueur]
-    hours = data["total_minutes"] / 60
-    ratio = data["kills"] / data["deaths"] if data["deaths"] > 0 else data["kills"]
-    
-    embed = discord.Embed(title=f"📊 Statistiques de {joueur}", color=discord.Color.blue())
-    embed.add_field(name="⏱️ Temps de jeu", value=f"{hours:.1f}h", inline=True)
-    embed.add_field(name="🎮 Sessions", value=str(data["sessions"]), inline=True)
-    embed.add_field(name="⚔️ Kills", value=str(data["kills"]), inline=True)
-    embed.add_field(name="☠️ Morts", value=str(data["deaths"]), inline=True)
-    embed.add_field(name="📊 Ratio K/D", value=f"{ratio:.2f}", inline=True)
-    embed.add_field(name="🧟 Zombies tués", value=str(data.get("zombie_kills", 0)), inline=True)
-    
-    if data.get("achievements"):
-        embed.add_field(name="🏆 Achievements", value=str(len(data["achievements"])), inline=True)
-    
-    await interaction.followup.send(embed=embed)
+# ── CLANS ─────────────────────────────────────
 
-@tree.command(name="createclan", description="Créer un clan")
+@tree.command(name="createclan", description="Créer un nouveau clan")
 async def slash_createclan(interaction: discord.Interaction, nom: str):
     await interaction.response.defer()
-    
-    player_name = interaction.user.display_name
-    
-    if player_name in clan_members:
-        await interaction.followup.send("❌ Tu es déjà dans un clan")
-        return
-    
+    pn = interaction.user.display_name
+    if pn in clan_members:
+        await interaction.followup.send(f"❌ Tu es déjà dans **{clan_members[pn]}**. Utilise `/leaveclan` d'abord."); return
     if nom in clans:
-        await interaction.followup.send("❌ Ce nom de clan existe déjà")
-        return
-    
-    clans[nom] = {
-        "leader": player_name,
-        "created": datetime.now().isoformat(),
-        "points": 0
-    }
-    clan_members[player_name] = nom
+        await interaction.followup.send("❌ Ce nom de clan existe déjà"); return
+    if len(nom) > CONFIG["MAX_CLAN_NAME_LENGTH"]:
+        await interaction.followup.send(f"❌ Nom max {CONFIG['MAX_CLAN_NAME_LENGTH']} caractères"); return
+    clans[nom] = {"leader": pn, "created": datetime.now().isoformat(), "points": 0}
+    clan_members[pn] = nom
     save_data()
-    
-    embed = discord.Embed(
-        title=f"🛡️ Clan créé : {nom}",
-        description=f"Chef: {player_name}",
-        color=discord.Color.green()
-    )
-    await interaction.followup.send(embed=embed)
+    e = discord.Embed(title=f"🛡️ Clan créé : {nom}", color=discord.Color.green())
+    e.add_field(name="👑 Chef", value=pn, inline=True)
+    e.set_footer(text=f"Les membres rejoignent avec /joinclan {nom}")
+    await interaction.followup.send(embed=e)
 
-@tree.command(name="joinclan", description="Rejoindre un clan")
+@tree.command(name="joinclan", description="Rejoindre un clan existant")
 async def slash_joinclan(interaction: discord.Interaction, nom: str):
     await interaction.response.defer()
-    
-    player_name = interaction.user.display_name
-    
-    if player_name in clan_members:
-        await interaction.followup.send("❌ Tu es déjà dans un clan")
-        return
-    
+    pn = interaction.user.display_name
+    if pn in clan_members:
+        await interaction.followup.send(f"❌ Tu es déjà dans **{clan_members[pn]}**"); return
     if nom not in clans:
-        await interaction.followup.send("❌ Ce clan n'existe pas")
-        return
-    
-    clan_members[player_name] = nom
+        await interaction.followup.send(f"❌ Le clan **{nom}** n'existe pas"); return
+    clan_members[pn] = nom
     save_data()
-    
-    await interaction.followup.send(f"✅ Tu as rejoint le clan **{nom}** !")
+    count = len([p for p,c in clan_members.items() if c==nom])
+    await interaction.followup.send(f"✅ Tu as rejoint **{nom}** ! ({count} membres au total)")
+
+@tree.command(name="leaveclan", description="Quitter ton clan actuel")
+async def slash_leaveclan(interaction: discord.Interaction):
+    await interaction.response.defer()
+    pn = interaction.user.display_name
+    if pn not in clan_members:
+        await interaction.followup.send("❌ Tu n'es dans aucun clan"); return
+    cn = clan_members[pn]
+    if clans[cn]["leader"] == pn:
+        others = [p for p,c in clan_members.items() if c==cn and p!=pn]
+        if others:
+            await interaction.followup.send("❌ Tu es chef ! Utilise `/transferleader` d'abord."); return
+        # Clan vide → supprimé + bounties rendues
+        for target, b in list(bounties.items()):
+            if b["proposer_clan"] == cn:
+                del bounties[target]
+        del clans[cn]
+    del clan_members[pn]
+    save_data()
+    await interaction.followup.send(f"✅ Tu as quitté **{cn}**")
+
+@tree.command(name="transferleader", description="Passer ton leadership à un autre membre")
+async def slash_transferleader(interaction: discord.Interaction, nouveau_chef: str):
+    await interaction.response.defer()
+    pn = interaction.user.display_name
+    if pn not in clan_members:
+        await interaction.followup.send("❌ Tu n'es dans aucun clan"); return
+    cn = clan_members[pn]
+    if not is_clan_leader(pn, cn):
+        await interaction.followup.send("❌ Tu n'es pas le chef"); return
+    if nouveau_chef not in clan_members or clan_members[nouveau_chef] != cn:
+        await interaction.followup.send(f"❌ **{nouveau_chef}** n'est pas dans ton clan"); return
+    if nouveau_chef == pn:
+        await interaction.followup.send("❌ Tu es déjà le chef !"); return
+    clans[cn]["leader"] = nouveau_chef
+    save_data()
+    e = discord.Embed(title="👑 Leadership transféré", color=discord.Color.gold())
+    e.add_field(name="Clan",         value=cn,           inline=True)
+    e.add_field(name="Ancien chef",  value=pn,           inline=True)
+    e.add_field(name="Nouveau chef", value=nouveau_chef, inline=True)
+    await interaction.followup.send(embed=e)
+
+@tree.command(name="claninfo", description="Infos détaillées d'un clan")
+async def slash_claninfo(interaction: discord.Interaction, nom: str):
+    await interaction.response.defer()
+    if nom not in clans:
+        await interaction.followup.send(f"❌ Le clan **{nom}** n'existe pas"); return
+    clan    = clans[nom]
+    members = [p for p,c in clan_members.items() if c==nom]
+    created = datetime.fromisoformat(clan["created"])
+    active_bounties = [(t,b) for t,b in bounties.items() if b["proposer_clan"]==nom]
+
+    e = discord.Embed(title=f"🛡️ {nom}", color=discord.Color.gold())
+    e.add_field(name="👑 Chef",    value=clan["leader"],               inline=True)
+    e.add_field(name="⭐ Points",  value=str(clan["points"]),          inline=True)
+    e.add_field(name="👥 Membres", value=str(len(members)),            inline=True)
+    e.add_field(name="📅 Créé le", value=created.strftime("%d/%m/%Y"),inline=True)
+    if members:
+        lines=[]
+        for m in members:
+            k = player_data.get(m,{}).get("kills",0)
+            crown = "👑 " if m==clan["leader"] else "   "
+            lines.append(f"{crown}**{m}** — {k} kills")
+        e.add_field(name="📋 Membres", value="\n".join(lines), inline=False)
+    if active_bounties:
+        e.add_field(name="💰 Primes actives",
+                    value="\n".join([f"🎯 {t} : {b['points']} pts" for t,b in active_bounties]),
+                    inline=False)
+    await interaction.followup.send(embed=e)
 
 @tree.command(name="clanleaderboard", description="Classement des clans")
 async def slash_clanleaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
-    
     if not clans:
-        await interaction.followup.send("❌ Aucun clan créé")
-        return
-    
-    sorted_clans = sorted(clans.items(), key=lambda x: x[1]["points"], reverse=True)
-    
-    embed = discord.Embed(title="🛡️ Classement des Clans", color=discord.Color.gold())
-    
-    for i, (name, data) in enumerate(sorted_clans[:10]):
-        members = [p for p, c in clan_members.items() if c == name]
-        medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
-        embed.add_field(
-            name=f"{medal} {name}",
-            value=f"👑 Chef: {data['leader']} • 👥 {len(members)} membres • ⭐ {data['points']} points",
-            inline=False
-        )
-    
-    await interaction.followup.send(embed=embed)
+        await interaction.followup.send("❌ Aucun clan créé"); return
+    sc = sorted(clans.items(), key=lambda x:x[1]["points"], reverse=True)
+    e  = discord.Embed(title="🛡️ Classement des Clans", color=discord.Color.gold())
+    e.set_footer(text=f"Points : inter-clan kill +{CONFIG['POINTS_INTERCLAN_KILL']}/-{CONFIG['POINTS_INTERCLAN_DEATH']} | {CONFIG['POINTS_PER_HOUR']}pt/h | achievements | bounties")
+    for i,(name,data) in enumerate(sc[:10]):
+        members=len([p for p,c in clan_members.items() if c==name])
+        medal=["🥇","🥈","🥉"][i] if i<3 else f"{i+1}."
+        e.add_field(name=f"{medal} {name}", value=f"👑 {data['leader']} • 👥 {members} membres • ⭐ {data['points']} pts", inline=False)
+    await interaction.followup.send(embed=e)
 
-@tree.command(name="setlogschannel", description="Salon des logs (proprio)")
-async def slash_setlogschannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not await owner_check(interaction):
-        return
-    
-    global LOGS_CHANNEL_ID
-    LOGS_CHANNEL_ID = channel.id
-    
-    await interaction.response.send_message(f"✅ Logs envoyés dans {channel.mention}", ephemeral=True)
-    await channel.send("📋 Ce salon recevra les logs du serveur.")
+# ── LOGS ──────────────────────────────────────
+
+@tree.command(name="uploadlogs", description="Uploader un fichier .log du serveur (proprio)")
+async def slash_uploadlogs(interaction: discord.Interaction, fichier: discord.Attachment):
+    if not await owner_check(interaction): return
+    await interaction.response.defer()
+    if not fichier.filename.endswith(('.log','.txt')):
+        await interaction.followup.send("❌ Fichier .log ou .txt uniquement"); return
+    try:
+        log_text = (await fichier.read()).decode('utf-8', errors='ignore')
+        events   = parse_minecraft_logs(log_text)
+        summary  = process_events(events)
+        e = discord.Embed(title="📊 Logs analysés", color=discord.Color.blue())
+        e.add_field(name="📋 Événements", value=str(len(events)),                  inline=True)
+        e.add_field(name="🔌 Connexions", value=str(len(summary["joins"])),        inline=True)
+        e.add_field(name="⚔️ Kills PvP",  value=str(len(summary["kills"])),        inline=True)
+        e.add_field(name="☠️ Morts",      value=str(len(summary["deaths"])),       inline=True)
+        e.add_field(name="🧟 Zombies",    value=str(len(summary["zombie_deaths"])),inline=True)
+        if summary["kills"]:
+            txt="\n".join(summary["kills"][:10])
+            if len(summary["kills"])>10: txt+=f"\n*...et {len(summary['kills'])-10} autres*"
+            e.add_field(name="🔪 Kills détectés", value=txt, inline=False)
+        await interaction.followup.send(embed=e)
+    except Exception as ex:
+        await interaction.followup.send(f"❌ Erreur : {ex}")
+
+# ── PANEL ADMIN COMPLET ───────────────────────
+
+@tree.command(name="config", description="Voir la configuration actuelle du bot (proprio)")
+async def slash_config(interaction: discord.Interaction):
+    if not await owner_check(interaction): return
+    e = discord.Embed(title="⚙️ Configuration du Bot", color=discord.Color.blurple())
+    for key, val in CONFIG.items():
+        e.add_field(name=key, value=str(val), inline=True)
+    e.set_footer(text="Modifie avec /setconfig <clé> <valeur>")
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+@tree.command(name="setconfig", description="Modifier un paramètre du bot (proprio)")
+async def slash_setconfig(interaction: discord.Interaction, cle: str, valeur: str):
+    """
+    Clés disponibles (exemples) :
+      HOURS_FOR_ACTIVE_ROLE    → nb d'heures pour avoir le rôle
+      POINTS_INTERCLAN_KILL    → points gagnés par kill inter-clan
+      POINTS_INTERCLAN_DEATH   → points perdus par mort inter-clan
+      POINTS_PER_HOUR          → points par heure de jeu
+      MAX_BOUNTY_POINTS        → prime max autorisée
+      ACTIVE_ROLE_NAME         → nom du rôle automatique
+    """
+    if not await owner_check(interaction): return
+    if cle not in CONFIG:
+        await interaction.response.send_message(f"❌ Clé **{cle}** inconnue. Utilise /config pour voir les clés.", ephemeral=True); return
+    try:
+        old = CONFIG[cle]
+        # Convertit dans le bon type
+        if isinstance(old, int):   CONFIG[cle] = int(valeur)
+        elif isinstance(old, float): CONFIG[cle] = float(valeur)
+        else:                       CONFIG[cle] = valeur
+        save_data()
+        await interaction.response.send_message(f"✅ **{cle}** : `{old}` → `{CONFIG[cle]}`", ephemeral=True)
+    except ValueError:
+        await interaction.response.send_message(f"❌ Valeur invalide pour **{cle}** (attendu : {type(CONFIG[cle]).__name__})", ephemeral=True)
+
+@tree.command(name="listplayers", description="Liste tous les joueurs enregistrés (proprio)")
+async def slash_listplayers(interaction: discord.Interaction):
+    if not await owner_check(interaction): return
+    if not player_data:
+        await interaction.response.send_message("❌ Aucun joueur enregistré", ephemeral=True); return
+    sp = sorted(player_data.items(), key=lambda x:x[1]["total_minutes"], reverse=True)
+    lines=[]
+    for name, d in sp:
+        h    = d["total_minutes"]/60
+        clan = clan_members.get(name,"-")
+        lines.append(f"**{name}** | {h:.1f}h | {d['kills']}K/{d['deaths']}D | [{clan}]")
+    # Découpe si trop long
+    chunks = [lines[i:i+20] for i in range(0, len(lines), 20)]
+    for i, chunk in enumerate(chunks):
+        e = discord.Embed(title=f"👥 Joueurs enregistrés ({i+1}/{len(chunks)})", color=discord.Color.blurple())
+        e.description = "\n".join(chunk)
+        await interaction.response.send_message(embed=e, ephemeral=True) if i==0 else await interaction.followup.send(embed=e, ephemeral=True)
+
+@tree.command(name="setpoints", description="Définir exactement les points d'un clan (proprio)")
+async def slash_setpoints(interaction: discord.Interaction, clan: str, points: int):
+    if not await owner_check(interaction): return
+    if clan not in clans:
+        await interaction.response.send_message("❌ Ce clan n'existe pas", ephemeral=True); return
+    old = clans[clan]["points"]
+    clans[clan]["points"] = max(0, points)
+    save_data()
+    await interaction.response.send_message(f"✅ Points de **{clan}** : {old} → {clans[clan]['points']}", ephemeral=True)
+
+@tree.command(name="addpoints", description="Ajouter/retirer des points à un clan (proprio)")
+async def slash_addpoints(interaction: discord.Interaction, clan: str, points: int):
+    if not await owner_check(interaction): return
+    if clan not in clans:
+        await interaction.response.send_message("❌ Ce clan n'existe pas", ephemeral=True); return
+    old = clans[clan]["points"]
+    clans[clan]["points"] = max(0, old + points)
+    save_data()
+    action = "ajoutés à" if points>=0 else "retirés de"
+    await interaction.response.send_message(f"✅ **{abs(points)}** pts {action} **{clan}** : {old} → {clans[clan]['points']}", ephemeral=True)
+
+@tree.command(name="renameclan", description="Renommer un clan (proprio)")
+async def slash_renameclan(interaction: discord.Interaction, ancien: str, nouveau: str):
+    if not await owner_check(interaction): return
+    if ancien not in clans:
+        await interaction.response.send_message("❌ Ce clan n'existe pas", ephemeral=True); return
+    if nouveau in clans:
+        await interaction.response.send_message("❌ Ce nouveau nom existe déjà", ephemeral=True); return
+    clans[nouveau] = clans.pop(ancien)
+    for p in clan_members:
+        if clan_members[p] == ancien:
+            clan_members[p] = nouveau
+    # Met à jour les bounties
+    for t in bounties:
+        if bounties[t]["proposer_clan"] == ancien:
+            bounties[t]["proposer_clan"] = nouveau
+    save_data()
+    await interaction.response.send_message(f"✅ Clan renommé : **{ancien}** → **{nouveau}**", ephemeral=True)
+
+@tree.command(name="givekill", description="Enregistrer manuellement un kill (proprio — pour corriger un bug)")
+async def slash_givekill(interaction: discord.Interaction, killer: str, victim: str):
+    if not await owner_check(interaction): return
+    init_player(killer); init_player(victim)
+    kills_before = player_data[killer].get("rivals",{}).get(victim,{}).get("deaths",0)
+    player_data[killer]["kills"]  += 1
+    player_data[victim]["deaths"] += 1
+    record_rivalry(killer, victim)
+    killer_clan = clan_members.get(killer)
+    victim_clan = clan_members.get(victim)
+    if killer_clan and victim_clan and killer_clan != victim_clan:
+        clans[killer_clan]["points"] += CONFIG["POINTS_INTERCLAN_KILL"]
+        clans[victim_clan]["points"]  = max(0, clans[victim_clan]["points"] - CONFIG["POINTS_INTERCLAN_DEATH"])
+        player_data[killer]["clan_kills"] = player_data[killer].get("clan_kills",0)+1
+    # Check bounty
+    bonus = ""
+    if victim in bounties:
+        b=bounties[victim]
+        if killer_clan and killer_clan != b["proposer_clan"]:
+            clans[killer_clan]["points"] += b["points"]
+            bonus = f" + **{b['points']}** pts de prime récupérée !"
+            del bounties[victim]
+    save_data()
+    await interaction.response.send_message(f"✅ Kill enregistré : **{killer}** → **{victim}**{bonus}", ephemeral=True)
+
+@tree.command(name="addtime", description="Ajouter du temps de jeu à un joueur (proprio)")
+async def slash_addtime(interaction: discord.Interaction, joueur: str, minutes: int):
+    if not await owner_check(interaction): return
+    init_player(joueur)
+    old = player_data[joueur]["total_minutes"]
+    player_data[joueur]["total_minutes"] += minutes
+    save_data()
+    h_old = old/60; h_new = (old+minutes)/60
+    await interaction.response.send_message(f"✅ **{joueur}** : {h_old:.1f}h → {h_new:.1f}h (+{minutes} min)", ephemeral=True)
+
+@tree.command(name="setleader", description="Changer le chef d'un clan (proprio)")
+async def slash_setleader(interaction: discord.Interaction, clan: str, nouveau_chef: str):
+    if not await owner_check(interaction): return
+    if clan not in clans:
+        await interaction.response.send_message("❌ Ce clan n'existe pas", ephemeral=True); return
+    if nouveau_chef in clan_members and clan_members[nouveau_chef] != clan:
+        await interaction.response.send_message(f"❌ **{nouveau_chef}** est dans un autre clan. Retire-le d'abord.", ephemeral=True); return
+    ancien = clans[clan]["leader"]
+    clans[clan]["leader"] = nouveau_chef
+    if nouveau_chef not in clan_members:
+        clan_members[nouveau_chef] = clan
+    save_data()
+    await interaction.response.send_message(f"✅ Chef de **{clan}** : **{ancien}** → **{nouveau_chef}**", ephemeral=True)
+
+@tree.command(name="deleteclan", description="Supprimer un clan (proprio)")
+async def slash_deleteclan(interaction: discord.Interaction, nom: str):
+    if not await owner_check(interaction): return
+    if nom not in clans:
+        await interaction.response.send_message("❌ Ce clan n'existe pas", ephemeral=True); return
+    # Rembourse les bounties actives de ce clan
+    refund = 0
+    for target, b in list(bounties.items()):
+        if b["proposer_clan"] == nom:
+            refund += b["points"]
+            del bounties[target]
+    removed=[p for p,c in clan_members.items() if c==nom]
+    for m in removed: del clan_members[m]
+    del clans[nom]
+    save_data()
+    msg = f"✅ **{nom}** supprimé ({len(removed)} membres retirés)"
+    if refund: msg += f"\n💰 {refund} pts de primes annulées (perdus car le clan n'existe plus)"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="addtoclan", description="Ajouter un joueur dans un clan (proprio)")
+async def slash_addtoclan(interaction: discord.Interaction, joueur: str, clan: str):
+    if not await owner_check(interaction): return
+    if clan not in clans:
+        await interaction.response.send_message("❌ Ce clan n'existe pas", ephemeral=True); return
+    if joueur in clan_members:
+        await interaction.response.send_message(f"❌ **{joueur}** est déjà dans **{clan_members[joueur]}**", ephemeral=True); return
+    clan_members[joueur] = clan
+    save_data()
+    await interaction.response.send_message(f"✅ **{joueur}** ajouté dans **{clan}**", ephemeral=True)
+
+@tree.command(name="removefromclan", description="Retirer un joueur d'un clan (proprio)")
+async def slash_removefromclan(interaction: discord.Interaction, joueur: str):
+    if not await owner_check(interaction): return
+    if joueur not in clan_members:
+        await interaction.response.send_message(f"❌ **{joueur}** n'est dans aucun clan", ephemeral=True); return
+    cn = clan_members[joueur]
+    if clans.get(cn,{}).get("leader") == joueur:
+        others=[p for p,c in clan_members.items() if c==cn and p!=joueur]
+        if others: clans[cn]["leader"] = others[0]
+    del clan_members[joueur]
+    save_data()
+    await interaction.response.send_message(f"✅ **{joueur}** retiré de **{cn}**", ephemeral=True)
+
+@tree.command(name="resetstats", description="Reset les stats d'un joueur (proprio)")
+async def slash_resetstats(interaction: discord.Interaction, joueur: str):
+    if not await owner_check(interaction): return
+    if joueur not in player_data:
+        await interaction.response.send_message(f"❌ Aucune donnée pour **{joueur}**", ephemeral=True); return
+    player_data[joueur] = {
+        "total_minutes":0,"sessions":0,"kills":0,"deaths":0,
+        "zombie_kills":0,"clan_kills":0,"last_seen":None,
+        "first_seen":datetime.now().isoformat(),"achievements":[],"rivals":{}
+    }
+    save_data()
+    await interaction.response.send_message(f"✅ Stats de **{joueur}** remises à zéro", ephemeral=True)
+
+@tree.command(name="cancelbountyAdmin", description="Forcer l'annulation d'une prime (proprio)")
+async def slash_cancelbountyadmin(interaction: discord.Interaction, cible: str, rembourser: bool):
+    """
+    Annule une prime de force.
+    rembourser=True  → rend les points au clan proposeur
+    rembourser=False → les points sont perdus
+    """
+    if not await owner_check(interaction): return
+    if cible not in bounties:
+        await interaction.response.send_message(f"❌ Aucune prime active sur **{cible}**", ephemeral=True); return
+    b   = bounties[cible]
+    msg = f"✅ Prime sur **{cible}** supprimée ({b['points']} pts)"
+    if rembourser and b["proposer_clan"] in clans:
+        clans[b["proposer_clan"]]["points"] += b["points"]
+        msg += f" — **{b['points']} pts rendus** à **{b['proposer_clan']}**"
+    else:
+        msg += " — points **perdus**"
+    del bounties[cible]
+    save_data()
+    await interaction.response.send_message(msg, ephemeral=True)
 
 @tree.command(name="setchannel", description="Salon des annonces (proprio)")
 async def slash_setchannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not await owner_check(interaction):
-        return
-    
-    global ANNOUNCEMENT_CHANNEL_ID
-    ANNOUNCEMENT_CHANNEL_ID = channel.id
-    
+    if not await owner_check(interaction): return
+    CONFIG["ANNOUNCEMENT_CHANNEL_ID"] = channel.id
+    save_data()
     await interaction.response.send_message(f"✅ Annonces dans {channel.mention}", ephemeral=True)
-    await channel.send("🔔 Annonces configurées.")
+    await channel.send("🔔 Ce salon recevra les annonces du serveur Minecraft.")
 
-@tree.command(name="status", description="Statut du serveur")
-async def slash_status(interaction: discord.Interaction):
-    await interaction.response.defer()
-    status = check_server_status()
-    
-    if status["online"]:
-        embed = discord.Embed(title=f"🎮 {SERVER_ADDRESS}", color=discord.Color.green())
-        embed.add_field(name="Statut", value="🟢 En ligne", inline=True)
-        embed.add_field(name="Joueurs", value=f"{status['players']}/{status['max_players']}", inline=True)
-        
-        if status["player_list"]:
-            embed.add_field(name="En ligne", value=", ".join(status["player_list"]), inline=False)
-    else:
-        embed = discord.Embed(title=f"🎮 {SERVER_ADDRESS}", description="🔴 Hors ligne", color=discord.Color.red())
-    
-    await interaction.followup.send(embed=embed)
+@tree.command(name="setlogschannel", description="Salon des logs (proprio)")
+async def slash_setlogschannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await owner_check(interaction): return
+    CONFIG["LOGS_CHANNEL_ID"] = channel.id
+    save_data()
+    await interaction.response.send_message(f"✅ Logs dans {channel.mention}", ephemeral=True)
+    await channel.send("📋 Ce salon recevra les connexions/déconnexions.")
 
-@tree.command(name="help", description="Liste des commandes")
+# ── AIDE ──────────────────────────────────────
+
+@tree.command(name="help", description="Liste de toutes les commandes")
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 Commandes", color=discord.Color.blurple())
-    embed.add_field(name="/status", value="Statut du serveur", inline=False)
-    embed.add_field(name="/stats <joueur>", value="Stats d'un joueur", inline=False)
-    embed.add_field(name="/pvpleaderboard", value="Classement PvP", inline=False)
-    embed.add_field(name="/createclan <nom>", value="Créer un clan", inline=False)
-    embed.add_field(name="/joinclan <nom>", value="Rejoindre un clan", inline=False)
-    embed.add_field(name="/clanleaderboard", value="Classement des clans", inline=False)
-    embed.add_field(name="/uploadlogs", value="Analyser logs (proprio)", inline=False)
-    await interaction.response.send_message(embed=embed)
+    e = discord.Embed(title="📖 Commandes du Bot Minecraft", color=discord.Color.blurple())
+
+    e.add_field(name="━━ 🎮 STATS ━━",               value="\u200b", inline=False)
+    e.add_field(name="/status",                       value="Statut serveur",              inline=True)
+    e.add_field(name="/stats <joueur>",               value="Stats complètes",             inline=True)
+    e.add_field(name="/pvpleaderboard",               value="Top kills PvP",               inline=True)
+    e.add_field(name="/top",                          value="Top temps de jeu",            inline=True)
+    e.add_field(name="/rivalry <j1> <j2>",            value="Historique entre 2 joueurs",  inline=True)
+    e.add_field(name="/myrivalry <adversaire>",       value="Tes stats vs un joueur",      inline=True)
+
+    e.add_field(name="━━ 💰 BOUNTIES ━━",             value="\u200b", inline=False)
+    e.add_field(name="/bounty <cible> <pts>",         value="Poser une prime (chef clan)", inline=True)
+    e.add_field(name="/cancelbounty <cible>",         value="Annuler ta prime",            inline=True)
+    e.add_field(name="/bounties",                     value="Voir toutes les primes",      inline=True)
+
+    e.add_field(name="━━ 🛡️ CLANS ━━",              value="\u200b", inline=False)
+    e.add_field(name="/createclan <nom>",             value="Créer un clan",               inline=True)
+    e.add_field(name="/joinclan <nom>",               value="Rejoindre un clan",           inline=True)
+    e.add_field(name="/leaveclan",                    value="Quitter ton clan",            inline=True)
+    e.add_field(name="/claninfo <nom>",               value="Infos d'un clan",             inline=True)
+    e.add_field(name="/clanleaderboard",              value="Classement des clans",        inline=True)
+    e.add_field(name="/transferleader <pseudo>",      value="Passer ton leadership",       inline=True)
+
+    e.add_field(name="━━ 👑 ADMIN (proprio) ━━",      value="\u200b", inline=False)
+    e.add_field(name="/config",                       value="Voir la config du bot",       inline=True)
+    e.add_field(name="/setconfig <clé> <valeur>",     value="Modifier la config",          inline=True)
+    e.add_field(name="/listplayers",                  value="Tous les joueurs enregistrés",inline=True)
+    e.add_field(name="/setleader <clan> <chef>",      value="Changer le chef d'un clan",   inline=True)
+    e.add_field(name="/setpoints <clan> <pts>",       value="Définir les points exactement",inline=True)
+    e.add_field(name="/addpoints <clan> <pts>",       value="Ajouter/retirer des points",  inline=True)
+    e.add_field(name="/renameclan <ancien> <nouveau>",value="Renommer un clan",            inline=True)
+    e.add_field(name="/givekill <killer> <victim>",   value="Enregistrer un kill manuellem.",inline=True)
+    e.add_field(name="/addtime <joueur> <min>",       value="Ajouter du temps de jeu",     inline=True)
+    e.add_field(name="/uploadlogs",                   value="Analyser logs MC (.log/.txt)",inline=True)
+    e.add_field(name="/deleteclan <nom>",             value="Supprimer un clan",           inline=True)
+    e.add_field(name="/addtoclan <j> <clan>",         value="Ajouter dans un clan",        inline=True)
+    e.add_field(name="/removefromclan <j>",           value="Retirer d'un clan",           inline=True)
+    e.add_field(name="/resetstats <joueur>",          value="Reset stats d'un joueur",     inline=True)
+    e.add_field(name="/cancelbountyAdmin <cible>",    value="Forcer annulation prime",     inline=True)
+    e.add_field(name="/setchannel / /setlogschannel", value="Configurer les salons",       inline=True)
+
+    e.set_footer(text="💡 Points bounty : retenus en escrow dès la création | rendus si annulation")
+    await interaction.response.send_message(embed=e)
 
 bot.run(BOT_TOKEN)
