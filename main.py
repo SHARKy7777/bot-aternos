@@ -397,16 +397,9 @@ async def slash_status(interaction: discord.Interaction):
     await interaction.response.defer()
     s = check_server_status()
     if s["online"]:
-        e = discord.Embed(title=f"🎮 {SERVER_DISPLAY_NAME}", color=discord.Color.green())
-        e.add_field(name="Statut",  value="🟢 En ligne",                                  inline=True)
-        e.add_field(name="Joueurs", value=f"{s['players']}/{s['max_players']}",           inline=True)
-        e.add_field(name="Ping",    value=f"{s['latency']}ms",                           inline=True)
-        e.add_field(name="🎮 En ligne", value=", ".join(s["player_list"]) or "Personne", inline=False)
+        e = discord.Embed(title=f"🎮 {SERVER_DISPLAY_NAME}", description="🟢 En ligne", color=discord.Color.green())
     else:
-        reason = s.get("reason", "Serveur éteint")
-        e = discord.Embed(
-            title=f"🎮 {SERVER_DISPLAY_NAME}",
-        )
+        e = discord.Embed(title=f"🎮 {SERVER_DISPLAY_NAME}", description="🔴 Hors ligne", color=discord.Color.red())
     await interaction.followup.send(embed=e)
 
 @tree.command(name="stats", description="Stats complètes d'un joueur")
