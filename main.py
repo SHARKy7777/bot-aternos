@@ -12,6 +12,7 @@ load_dotenv()
 BOT_TOKEN  = os.getenv("BOT_TOKEN")
 OWNER_ID   = 715572086898294907
 SERVER_ADDRESS = "lmanagil.aternos.me"
+SERVER_DISPLAY_NAME = "Serveur Minecraft"  # ← Nom affiché dans /status
 
 # ══════════════════════════════════════════════
 #  CONFIG (modifiable avec /setconfig)
@@ -396,16 +397,15 @@ async def slash_status(interaction: discord.Interaction):
     await interaction.response.defer()
     s = check_server_status()
     if s["online"]:
-        e = discord.Embed(title=f"🎮 {SERVER_ADDRESS}", color=discord.Color.green())
+        e = discord.Embed(title=f"🎮 {SERVER_DISPLAY_NAME}", color=discord.Color.green())
         e.add_field(name="Statut",  value="🟢 En ligne",                                  inline=True)
         e.add_field(name="Joueurs", value=f"{s['players']}/{s['max_players']}",           inline=True)
         e.add_field(name="Ping",    value=f"{s['latency']}ms",                           inline=True)
         e.add_field(name="🎮 En ligne", value=", ".join(s["player_list"]) or "Personne", inline=False)
     else:
-        # ✅ Affiche la raison si disponible (ex: "Serveur en veille (0/0)")
         reason = s.get("reason", "Serveur éteint ou inaccessible")
         e = discord.Embed(
-            title=f"🎮 {SERVER_ADDRESS}",
+            title=f"🎮 {SERVER_DISPLAY_NAME}",
             description=f"🔴 Hors ligne\n*{reason}*\n*(Sur Aternos, démarre-le manuellement)*",
             color=discord.Color.red()
         )
@@ -968,48 +968,52 @@ async def slash_setlogschannel(interaction: discord.Interaction, channel: discor
 
 @tree.command(name="help", description="Liste de toutes les commandes")
 async def slash_help(interaction: discord.Interaction):
-    e = discord.Embed(title="📖 Commandes du Bot Minecraft", color=discord.Color.blurple())
+    # ── Embed 1 : Stats + Bounties + Clans (max 25 champs) ──
+    e1 = discord.Embed(title="📖 Commandes du Bot Minecraft (1/2)", color=discord.Color.blurple())
 
-    e.add_field(name="━━ 🎮 STATS ━━",               value="\u200b", inline=False)
-    e.add_field(name="/status",                       value="Statut serveur",              inline=True)
-    e.add_field(name="/stats <joueur>",               value="Stats complètes",             inline=True)
-    e.add_field(name="/pvpleaderboard",               value="Top kills PvP",               inline=True)
-    e.add_field(name="/top",                          value="Top temps de jeu",            inline=True)
-    e.add_field(name="/rivalry <j1> <j2>",            value="Historique entre 2 joueurs",  inline=True)
-    e.add_field(name="/myrivalry <adversaire>",       value="Tes stats vs un joueur",      inline=True)
+    e1.add_field(name="━━ 🎮 STATS ━━",               value="\u200b", inline=False)
+    e1.add_field(name="/status",                       value="Statut serveur",              inline=True)
+    e1.add_field(name="/stats <joueur>",               value="Stats complètes",             inline=True)
+    e1.add_field(name="/pvpleaderboard",               value="Top kills PvP",               inline=True)
+    e1.add_field(name="/top",                          value="Top temps de jeu",            inline=True)
+    e1.add_field(name="/rivalry <j1> <j2>",            value="Historique entre 2 joueurs",  inline=True)
+    e1.add_field(name="/myrivalry <adversaire>",       value="Tes stats vs un joueur",      inline=True)
 
-    e.add_field(name="━━ 💰 BOUNTIES ━━",             value="\u200b", inline=False)
-    e.add_field(name="/bounty <cible> <pts>",         value="Poser une prime (chef clan)", inline=True)
-    e.add_field(name="/cancelbounty <cible>",         value="Annuler ta prime",            inline=True)
-    e.add_field(name="/bounties",                     value="Voir toutes les primes",      inline=True)
+    e1.add_field(name="━━ 💰 BOUNTIES ━━",             value="\u200b", inline=False)
+    e1.add_field(name="/bounty <cible> <pts>",         value="Poser une prime (chef clan)", inline=True)
+    e1.add_field(name="/cancelbounty <cible>",         value="Annuler ta prime",            inline=True)
+    e1.add_field(name="/bounties",                     value="Voir toutes les primes",      inline=True)
 
-    e.add_field(name="━━ 🛡️ CLANS ━━",              value="\u200b", inline=False)
-    e.add_field(name="/createclan <nom>",             value="Créer un clan",               inline=True)
-    e.add_field(name="/joinclan <nom>",               value="Rejoindre un clan",           inline=True)
-    e.add_field(name="/leaveclan",                    value="Quitter ton clan",            inline=True)
-    e.add_field(name="/claninfo <nom>",               value="Infos d'un clan",             inline=True)
-    e.add_field(name="/clanleaderboard",              value="Classement des clans",        inline=True)
-    e.add_field(name="/transferleader <pseudo>",      value="Passer ton leadership",       inline=True)
+    e1.add_field(name="━━ 🛡️ CLANS ━━",              value="\u200b", inline=False)
+    e1.add_field(name="/createclan <nom>",             value="Créer un clan",               inline=True)
+    e1.add_field(name="/joinclan <nom>",               value="Rejoindre un clan",           inline=True)
+    e1.add_field(name="/leaveclan",                    value="Quitter ton clan",            inline=True)
+    e1.add_field(name="/claninfo <nom>",               value="Infos d'un clan",             inline=True)
+    e1.add_field(name="/clanleaderboard",              value="Classement des clans",        inline=True)
+    e1.add_field(name="/transferleader <pseudo>",      value="Passer ton leadership",       inline=True)
 
-    e.add_field(name="━━ 👑 ADMIN (proprio) ━━",      value="\u200b", inline=False)
-    e.add_field(name="/config",                       value="Voir la config du bot",       inline=True)
-    e.add_field(name="/setconfig <clé> <valeur>",     value="Modifier la config",          inline=True)
-    e.add_field(name="/listplayers",                  value="Tous les joueurs enregistrés",inline=True)
-    e.add_field(name="/setleader <clan> <chef>",      value="Changer le chef d'un clan",   inline=True)
-    e.add_field(name="/setpoints <clan> <pts>",       value="Définir les points exactement",inline=True)
-    e.add_field(name="/addpoints <clan> <pts>",       value="Ajouter/retirer des points",  inline=True)
-    e.add_field(name="/renameclan <ancien> <nouveau>",value="Renommer un clan",            inline=True)
-    e.add_field(name="/givekill <killer> <victim>",   value="Enregistrer un kill manuellem.",inline=True)
-    e.add_field(name="/addtime <joueur> <min>",       value="Ajouter du temps de jeu",     inline=True)
-    e.add_field(name="/uploadlogs",                   value="Analyser logs MC (.log/.txt)",inline=True)
-    e.add_field(name="/deleteclan <nom>",             value="Supprimer un clan",           inline=True)
-    e.add_field(name="/addtoclan <j> <clan>",         value="Ajouter dans un clan",        inline=True)
-    e.add_field(name="/removefromclan <j>",           value="Retirer d'un clan",           inline=True)
-    e.add_field(name="/resetstats <joueur>",          value="Reset stats d'un joueur",     inline=True)
-    e.add_field(name="/cancelbountyAdmin <cible>",    value="Forcer annulation prime",     inline=True)
-    e.add_field(name="/setchannel / /setlogschannel", value="Configurer les salons",       inline=True)
+    # ── Embed 2 : Admin ──
+    e2 = discord.Embed(title="📖 Commandes Admin (2/2)", color=discord.Color.gold())
+    e2.add_field(name="━━ 👑 ADMIN (proprio) ━━",      value="\u200b", inline=False)
+    e2.add_field(name="/config",                       value="Voir la config du bot",        inline=True)
+    e2.add_field(name="/setconfig <clé> <valeur>",     value="Modifier la config",           inline=True)
+    e2.add_field(name="/listplayers",                  value="Tous les joueurs enregistrés", inline=True)
+    e2.add_field(name="/setleader <clan> <chef>",      value="Changer le chef d'un clan",    inline=True)
+    e2.add_field(name="/setpoints <clan> <pts>",       value="Définir les points exactement",inline=True)
+    e2.add_field(name="/addpoints <clan> <pts>",       value="Ajouter/retirer des points",   inline=True)
+    e2.add_field(name="/renameclan <ancien> <nouveau>",value="Renommer un clan",             inline=True)
+    e2.add_field(name="/givekill <killer> <victim>",   value="Enregistrer un kill manuellement",inline=True)
+    e2.add_field(name="/addtime <joueur> <min>",       value="Ajouter du temps de jeu",      inline=True)
+    e2.add_field(name="/uploadlogs",                   value="Analyser logs MC (.log/.txt)", inline=True)
+    e2.add_field(name="/deleteclan <nom>",             value="Supprimer un clan",            inline=True)
+    e2.add_field(name="/addtoclan <j> <clan>",         value="Ajouter dans un clan",         inline=True)
+    e2.add_field(name="/removefromclan <j>",           value="Retirer d'un clan",            inline=True)
+    e2.add_field(name="/resetstats <joueur>",          value="Reset stats d'un joueur",      inline=True)
+    e2.add_field(name="/cancelbountyadmin <cible>",    value="Forcer annulation prime",      inline=True)
+    e2.add_field(name="/setchannel",                   value="Salon des annonces",           inline=True)
+    e2.add_field(name="/setlogschannel",               value="Salon des logs",               inline=True)
+    e2.set_footer(text="💡 Points bounty : retenus en escrow dès la création | rendus si annulation")
 
-    e.set_footer(text="💡 Points bounty : retenus en escrow dès la création | rendus si annulation")
-    await interaction.response.send_message(embed=e)
+    await interaction.response.send_message(embeds=[e1, e2])
 
 bot.run(BOT_TOKEN)
