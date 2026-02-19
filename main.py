@@ -52,17 +52,6 @@ current_session_players = {}
 # ══════════════════════════════════════════════
 #  SYSTÈME DE BOUNTY (PRIMES)
 # ══════════════════════════════════════════════
-# Structure : bounties[target] = {
-#   "proposer_clan": "NomClan",
-#   "proposed_by":   "NomJoueur",   ← qui a lancé la prime
-#   "points":        200,            ← points EN ESCROW (déjà retirés du clan)
-#   "created":       "2026-...",
-# }
-# Les points sont retirés du clan DÈS la création.
-# → Annulation : points rendus au clan proposeur
-# → Kill valide (autre clan) : points transférés au clan du killer
-# → Kill par le MÊME clan : bounty reste active, 0 reward (anti-farm)
-
 bounties = {}
 
 # ══════════════════════════════════════════════
@@ -80,7 +69,6 @@ def load_data():
         missions          = data.get("missions", {})
         achievements_data = data.get("achievements", {})
         bounties          = data.get("bounties", {})
-        # Charge aussi la config sauvegardée
         saved_config = data.get("config", {})
         for k, v in saved_config.items():
             if k in CONFIG:
@@ -121,7 +109,7 @@ def init_player(name):
             "last_seen": None,
             "first_seen": datetime.now().isoformat(),
             "achievements": [],
-            "rivals": {}       # {adversaire: {kills: X, deaths: Y}}
+            "rivals": {}
         }
 
 def update_playtime(name, minutes):
@@ -129,7 +117,6 @@ def update_playtime(name, minutes):
     player_data[name]["total_minutes"] += minutes
     player_data[name]["sessions"]      += 1
     player_data[name]["last_seen"]      = datetime.now().isoformat()
-    # Points par heure pour le clan
     if name in clan_members:
         cn = clan_members[name]
         if cn in clans:
@@ -213,11 +200,9 @@ def parse_minecraft_logs(log_content):
     return events
 
 def process_kill(killer, victim, summary_kills):
-    """Traite un kill PvP : stats, rivalités, points clans, bounties, achievements."""
     init_player(killer)
     init_player(victim)
 
-    # Vérifie comeback AVANT d'enregistrer
     deaths_before = player_data[killer].get("rivals", {}).get(victim, {}).get("deaths", 0)
 
     player_data[killer]["kills"]  += 1
@@ -229,23 +214,18 @@ def process_kill(killer, victim, summary_kills):
     killer_clan = clan_members.get(killer)
     victim_clan = clan_members.get(victim)
 
-    # ── Points inter-clans ──
     if killer_clan and victim_clan and killer_clan != victim_clan:
         clans[killer_clan]["points"] += CONFIG["POINTS_INTERCLAN_KILL"]
         clans[victim_clan]["points"]  = max(0, clans[victim_clan]["points"] - CONFIG["POINTS_INTERCLAN_DEATH"])
         player_data[killer]["clan_kills"] = player_data[killer].get("clan_kills", 0) + 1
         check_achievement(killer, "clan_warrior")
 
-    # ── BOUNTIES ──
-    # Si la victime a une prime sur la tête
     if victim in bounties:
         b = bounties[victim]
         proposer_clan = b["proposer_clan"]
         bounty_pts    = b["points"]
 
-        # ✅ Anti-farm : le clan qui a posé la prime ne peut pas la récupérer lui-même
         if killer_clan and killer_clan != proposer_clan:
-            # Prime récupérée ! Transfert des points vers le clan du killer
             if killer_clan in clans:
                 clans[killer_clan]["points"] += bounty_pts
             del bounties[victim]
@@ -253,10 +233,8 @@ def process_kill(killer, victim, summary_kills):
             check_achievement(killer, "bounty_hunter")
             print(f"[Bounty] {killer} ({killer_clan}) a récupéré la prime sur {victim} : +{bounty_pts} pts")
         else:
-            # Même clan ou killer sans clan → prime reste active, aucun reward
             print(f"[Bounty] Kill ignoré pour la prime : {killer} est du même clan que le proposeur ({proposer_clan})")
 
-    # ── Achievements ──
     if player_data[killer]["kills"] == 1: check_achievement(killer, "first_blood")
     if player_data[killer]["kills"] >= 50: check_achievement(killer, "pvp_master")
     check_achievement(killer, "nemesis",  extra=victim)
@@ -283,24 +261,45 @@ def process_events(events):
     return summary
 
 # ══════════════════════════════════════════════
-#  SERVEUR MC
+#  SERVEUR MC — CORRIGÉ
 # ══════════════════════════════════════════════
 
 def check_server_status():
-    global mc_server
+    """
+    CORRECTIF : On recrée l'objet JavaServer à chaque appel avec un timeout
+    strict de 5 secondes pour éviter les faux positifs sur Aternos.
+    """
     try:
-        if mc_server is None:
-            mc_server = JavaServer.lookup(SERVER_ADDRESS)
-        status = mc_server.status()
+        # ✅ Recrée l'objet à chaque fois (évite le cache DNS/connexion)
+        server = JavaServer.lookup(SERVER_ADDRESS, timeout=5)
+        status = server.status()
+
+        # Vérifie que la réponse est cohérente (Aternos renvoie parfois 0/0)
+        if status.players.max == 0 and status.players.online == 0:
+            # Deuxième tentative pour confirmer
+            try:
+                status2 = server.status()
+                if status2.players.max == 0:
+                    return {"online": False, "player_list": [], "reason": "Serveur en veille (0/0)"}
+            except:
+                return {"online": False, "player_list": []}
+
         try:
-            query       = mc_server.query()
+            query       = server.query()
             player_list = query.players.names if query.players.names else []
         except:
             player_list = []
-        return {"online": True, "players": status.players.online,
-                "max_players": status.players.max, "version": status.version.name,
-                "latency": round(status.latency, 1), "player_list": player_list}
-    except:
+
+        return {
+            "online": True,
+            "players": status.players.online,
+            "max_players": status.players.max,
+            "version": status.version.name,
+            "latency": round(status.latency, 1),
+            "player_list": player_list
+        }
+    except Exception as e:
+        print(f"[MC] Serveur injoignable : {e}")
         return {"online": False, "player_list": []}
 
 async def check_and_give_role(guild, player_name):
@@ -392,22 +391,24 @@ def is_clan_leader(player_name, clan_name):
 #  ═══════ COMMANDES SLASH ═══════
 # ══════════════════════════════════════════════
 
-# ── SERVEUR & STATS ───────────────────────────
-
 @tree.command(name="status", description="Statut du serveur Minecraft")
 async def slash_status(interaction: discord.Interaction):
     await interaction.response.defer()
     s = check_server_status()
     if s["online"]:
         e = discord.Embed(title=f"🎮 {SERVER_ADDRESS}", color=discord.Color.green())
-        e.add_field(name="Statut",  value="🟢 En ligne",                               inline=True)
-        e.add_field(name="Joueurs", value=f"{s['players']}/{s['max_players']}",        inline=True)
-        e.add_field(name="Ping",    value=f"{s['latency']}ms",                        inline=True)
+        e.add_field(name="Statut",  value="🟢 En ligne",                                  inline=True)
+        e.add_field(name="Joueurs", value=f"{s['players']}/{s['max_players']}",           inline=True)
+        e.add_field(name="Ping",    value=f"{s['latency']}ms",                           inline=True)
         e.add_field(name="🎮 En ligne", value=", ".join(s["player_list"]) or "Personne", inline=False)
     else:
-        e = discord.Embed(title=f"🎮 {SERVER_ADDRESS}",
-                          description="🔴 Hors ligne\n*(Sur Aternos, démarre-le manuellement)*",
-                          color=discord.Color.red())
+        # ✅ Affiche la raison si disponible (ex: "Serveur en veille (0/0)")
+        reason = s.get("reason", "Serveur éteint ou inaccessible")
+        e = discord.Embed(
+            title=f"🎮 {SERVER_ADDRESS}",
+            description=f"🔴 Hors ligne\n*{reason}*\n*(Sur Aternos, démarre-le manuellement)*",
+            color=discord.Color.red()
+        )
     await interaction.followup.send(embed=e)
 
 @tree.command(name="stats", description="Stats complètes d'un joueur")
@@ -429,7 +430,6 @@ async def slash_stats(interaction: discord.Interaction, joueur: str):
     e.add_field(name="🧟 Zombies",           value=str(d.get("zombie_kills",0)),      inline=True)
     e.add_field(name="🛡️ Kills inter-clan", value=str(d.get("clan_kills",0)),        inline=True)
 
-    # Bounty active ?
     if joueur in bounties:
         b = bounties[joueur]
         e.add_field(name="💰 Prime active !", value=f"{b['points']} pts — posée par [{b['proposer_clan']}]", inline=False)
@@ -520,13 +520,6 @@ async def slash_top(interaction: discord.Interaction):
 
 @tree.command(name="bounty", description="Poser une prime sur un joueur ennemi")
 async def slash_bounty(interaction: discord.Interaction, cible: str, points: int):
-    """
-    Pose une prime sur 'cible'.
-    - Les points sont retirés IMMÉDIATEMENT du clan proposeur (escrow)
-    - Si annulée → points rendus
-    - Si quelqu'un d'un AUTRE clan tue la cible → points transférés
-    - Si un membre du MÊME clan tue la cible → bounty reste active (anti-farm)
-    """
     await interaction.response.defer()
     player_name = interaction.user.display_name
 
@@ -547,18 +540,15 @@ async def slash_bounty(interaction: discord.Interaction, cible: str, points: int
     if clans[clan_name]["points"] < points:
         await interaction.followup.send(f"❌ Ton clan n'a que **{clans[clan_name]['points']}** points, pas assez pour cette prime"); return
 
-    # Vérif cible
     if cible not in player_data:
         await interaction.followup.send(f"❌ **{cible}** n'a jamais joué sur le serveur"); return
 
-    # Vérif : pas une prime sur un membre de son propre clan
     if clan_members.get(cible) == clan_name:
         await interaction.followup.send("❌ Tu ne peux pas mettre une prime sur un membre de TON clan"); return
 
     if cible in bounties:
         await interaction.followup.send(f"❌ **{cible}** a déjà une prime active ({bounties[cible]['points']} pts)"); return
 
-    # Retrait immédiat des points (escrow)
     clans[clan_name]["points"] -= points
     bounties[cible] = {
         "proposer_clan": clan_name,
@@ -569,19 +559,15 @@ async def slash_bounty(interaction: discord.Interaction, cible: str, points: int
     save_data()
 
     e = discord.Embed(title="💰 Prime posée !", color=discord.Color.gold())
-    e.add_field(name="🎯 Cible",     value=cible,                             inline=True)
-    e.add_field(name="💰 Récompense",value=f"{points} pts",                  inline=True)
-    e.add_field(name="📤 Proposé par",value=f"{player_name} [{clan_name}]",  inline=True)
-    e.add_field(name="ℹ️ Info",      value=f"Les {points} pts ont été retirés de **{clan_name}**. Ils seront rendus si la prime est annulée.", inline=False)
+    e.add_field(name="🎯 Cible",      value=cible,                            inline=True)
+    e.add_field(name="💰 Récompense", value=f"{points} pts",                 inline=True)
+    e.add_field(name="📤 Proposé par",value=f"{player_name} [{clan_name}]", inline=True)
+    e.add_field(name="ℹ️ Info",       value=f"Les {points} pts ont été retirés de **{clan_name}**. Ils seront rendus si la prime est annulée.", inline=False)
     e.set_footer(text="⚠️ Un membre du même clan ne peut pas récupérer la prime (anti-farm)")
     await interaction.followup.send(embed=e)
 
 @tree.command(name="cancelbounty", description="Annuler une prime et récupérer les points")
 async def slash_cancelbounty(interaction: discord.Interaction, cible: str):
-    """
-    Annule la prime sur 'cible' et rend les points au clan proposeur.
-    Seul le chef du clan proposeur ou le proprio peut annuler.
-    """
     await interaction.response.defer()
     player_name = interaction.user.display_name
 
@@ -589,7 +575,6 @@ async def slash_cancelbounty(interaction: discord.Interaction, cible: str):
         await interaction.followup.send(f"❌ Aucune prime active sur **{cible}**"); return
 
     b = bounties[cible]
-    # Vérifie les droits : proprio OU chef du clan qui a posé la prime
     is_owner    = interaction.user.id == OWNER_ID
     is_proposer = (player_name in clan_members
                    and clan_members[player_name] == b["proposer_clan"]
@@ -598,7 +583,6 @@ async def slash_cancelbounty(interaction: discord.Interaction, cible: str):
     if not is_owner and not is_proposer:
         await interaction.followup.send("❌ Seul le chef du clan proposeur ou le proprio peut annuler cette prime"); return
 
-    # Retour des points
     pts  = b["points"]
     clan = b["proposer_clan"]
     if clan in clans:
@@ -668,7 +652,6 @@ async def slash_leaveclan(interaction: discord.Interaction):
         others = [p for p,c in clan_members.items() if c==cn and p!=pn]
         if others:
             await interaction.followup.send("❌ Tu es chef ! Utilise `/transferleader` d'abord."); return
-        # Clan vide → supprimé + bounties rendues
         for target, b in list(bounties.items()):
             if b["proposer_clan"] == cn:
                 del bounties[target]
@@ -779,24 +762,14 @@ async def slash_config(interaction: discord.Interaction):
 
 @tree.command(name="setconfig", description="Modifier un paramètre du bot (proprio)")
 async def slash_setconfig(interaction: discord.Interaction, cle: str, valeur: str):
-    """
-    Clés disponibles (exemples) :
-      HOURS_FOR_ACTIVE_ROLE    → nb d'heures pour avoir le rôle
-      POINTS_INTERCLAN_KILL    → points gagnés par kill inter-clan
-      POINTS_INTERCLAN_DEATH   → points perdus par mort inter-clan
-      POINTS_PER_HOUR          → points par heure de jeu
-      MAX_BOUNTY_POINTS        → prime max autorisée
-      ACTIVE_ROLE_NAME         → nom du rôle automatique
-    """
     if not await owner_check(interaction): return
     if cle not in CONFIG:
         await interaction.response.send_message(f"❌ Clé **{cle}** inconnue. Utilise /config pour voir les clés.", ephemeral=True); return
     try:
         old = CONFIG[cle]
-        # Convertit dans le bon type
-        if isinstance(old, int):   CONFIG[cle] = int(valeur)
+        if isinstance(old, int):     CONFIG[cle] = int(valeur)
         elif isinstance(old, float): CONFIG[cle] = float(valeur)
-        else:                       CONFIG[cle] = valeur
+        else:                        CONFIG[cle] = valeur
         save_data()
         await interaction.response.send_message(f"✅ **{cle}** : `{old}` → `{CONFIG[cle]}`", ephemeral=True)
     except ValueError:
@@ -813,7 +786,6 @@ async def slash_listplayers(interaction: discord.Interaction):
         h    = d["total_minutes"]/60
         clan = clan_members.get(name,"-")
         lines.append(f"**{name}** | {h:.1f}h | {d['kills']}K/{d['deaths']}D | [{clan}]")
-    # Découpe si trop long
     chunks = [lines[i:i+20] for i in range(0, len(lines), 20)]
     for i, chunk in enumerate(chunks):
         e = discord.Embed(title=f"👥 Joueurs enregistrés ({i+1}/{len(chunks)})", color=discord.Color.blurple())
@@ -852,18 +824,16 @@ async def slash_renameclan(interaction: discord.Interaction, ancien: str, nouvea
     for p in clan_members:
         if clan_members[p] == ancien:
             clan_members[p] = nouveau
-    # Met à jour les bounties
     for t in bounties:
         if bounties[t]["proposer_clan"] == ancien:
             bounties[t]["proposer_clan"] = nouveau
     save_data()
     await interaction.response.send_message(f"✅ Clan renommé : **{ancien}** → **{nouveau}**", ephemeral=True)
 
-@tree.command(name="givekill", description="Enregistrer manuellement un kill (proprio — pour corriger un bug)")
+@tree.command(name="givekill", description="Enregistrer manuellement un kill (proprio)")
 async def slash_givekill(interaction: discord.Interaction, killer: str, victim: str):
     if not await owner_check(interaction): return
     init_player(killer); init_player(victim)
-    kills_before = player_data[killer].get("rivals",{}).get(victim,{}).get("deaths",0)
     player_data[killer]["kills"]  += 1
     player_data[victim]["deaths"] += 1
     record_rivalry(killer, victim)
@@ -873,7 +843,6 @@ async def slash_givekill(interaction: discord.Interaction, killer: str, victim: 
         clans[killer_clan]["points"] += CONFIG["POINTS_INTERCLAN_KILL"]
         clans[victim_clan]["points"]  = max(0, clans[victim_clan]["points"] - CONFIG["POINTS_INTERCLAN_DEATH"])
         player_data[killer]["clan_kills"] = player_data[killer].get("clan_kills",0)+1
-    # Check bounty
     bonus = ""
     if victim in bounties:
         b=bounties[victim]
@@ -913,7 +882,6 @@ async def slash_deleteclan(interaction: discord.Interaction, nom: str):
     if not await owner_check(interaction): return
     if nom not in clans:
         await interaction.response.send_message("❌ Ce clan n'existe pas", ephemeral=True); return
-    # Rembourse les bounties actives de ce clan
     refund = 0
     for target, b in list(bounties.items()):
         if b["proposer_clan"] == nom:
@@ -966,11 +934,6 @@ async def slash_resetstats(interaction: discord.Interaction, joueur: str):
 
 @tree.command(name="cancelbountyadmin", description="Forcer l'annulation d'une prime (proprio)")
 async def slash_cancelbountyadmin(interaction: discord.Interaction, cible: str, rembourser: bool):
-    """
-    Annule une prime de force.
-    rembourser=True  → rend les points au clan proposeur
-    rembourser=False → les points sont perdus
-    """
     if not await owner_check(interaction): return
     if cible not in bounties:
         await interaction.response.send_message(f"❌ Aucune prime active sur **{cible}**", ephemeral=True); return
