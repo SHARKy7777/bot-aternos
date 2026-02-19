@@ -964,7 +964,7 @@ async def slash_resetstats(interaction: discord.Interaction, joueur: str):
     save_data()
     await interaction.response.send_message(f"✅ Stats de **{joueur}** remises à zéro", ephemeral=True)
 
-@tree.command(name="cancelbountyAdmin", description="Forcer l'annulation d'une prime (proprio)")
+@tree.command(name="cancelbountyadmin", description="Forcer l'annulation d'une prime (proprio)")
 async def slash_cancelbountyadmin(interaction: discord.Interaction, cible: str, rembourser: bool):
     """
     Annule une prime de force.
