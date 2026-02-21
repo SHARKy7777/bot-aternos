@@ -181,22 +181,40 @@ def check_achievement(player, ach_id, extra=None):
 # ══════════════════════════════════════════════
 
 def parse_minecraft_logs(log_content):
-    events   = []
+    events = []
+
+    # Supporte les deux formats :
+    # Vanilla/Spigot : [HH:MM:SS] [Server thread/INFO] ...
+    # Forge Aternos  : [DDMmmYYYY HH:MM:SS.mmm] [Server thread/INFO] ...
+    TIME_PAT = r"(?:\[\d{2}:\d{2}:\d{2}\]|\[\d{1,2}\w+\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\])"
+
     patterns = {
-        "join":         r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+joined the game",
-        "leave":        r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+left the game",
-        "pvp_kill":     r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+was (?:slain|killed) by (\w+)",
-        "zombie_death": r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+was (?:slain|killed) by (?:Zombie|zombie)",
-        "fall_death":   r"\[(\d{2}:\d{2}:\d{2})\].*?(\w+)\s+(?:fell|died)",
+        "join":         TIME_PAT + r".*?(\w+)\s+joined the game",
+        "leave":        TIME_PAT + r".*?(\w+)\s+left the game",
+        "zombie_death": TIME_PAT + r".*?(\w+)\s+was (?:slain|killed) by (?:Zombie|zombie)",
+        "pvp_kill":     TIME_PAT + r".*?(\w+)\s+was (?:slain|killed) by (\w+)",
+        "fall_death":   TIME_PAT + r".*?(\w+)\s+(?:fell from a high place|fell off|died|hit the ground too hard|drowned|burned to death|starved to death)",
     }
+
+    MOBS = {"Zombie","Skeleton","Creeper","Spider","Witch","Enderman","Blaze","Ghast",
+            "Slime","Phantom","Drowned","Husk","Stray","Pillager","Ravager","Wither",
+            "Ender_Dragon","Vindicator","Evoker","Guardian","Shulker","Silverfish"}
+
     for line in log_content.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
         for etype, pat in patterns.items():
             m = re.search(pat, line)
             if m:
+                g = m.groups()  # groupe 0 = player/victim, groupe 1 = killer (si pvp)
                 if etype == "pvp_kill":
-                    events.append({"type": etype, "time": m.group(1), "victim": m.group(2), "killer": m.group(3)})
+                    victim = g[0]
+                    killer = g[1]
+                    if killer not in MOBS:
+                        events.append({"type": etype, "time": "00:00:00", "victim": victim, "killer": killer})
                 else:
-                    events.append({"type": etype, "time": m.group(1), "player": m.group(2)})
+                    events.append({"type": etype, "time": "00:00:00", "player": g[0]})
                 break
     return events
 
@@ -360,16 +378,17 @@ async def server_monitor():
             update_playtime(p, (datetime.now() - t).total_seconds() / 60)
         current_session_players.clear()
 
-    if previous_status is not None and previous_status != online:
+    if previous_status != online:
         ch_id = CONFIG["ANNOUNCEMENT_CHANNEL_ID"]
         if ch_id:
             ch = bot.get_channel(ch_id)
             if ch:
                 if online:
-                    e = discord.Embed(title="🟢 Serveur en ligne !", description=f"**{SERVER_ADDRESS}** est accessible !", color=discord.Color.green())
+                    e = discord.Embed(title="🟢 Serveur en ligne !", description=f"**{SERVER_DISPLAY_NAME}** est accessible !", color=discord.Color.green())
                     await ch.send("@everyone", embed=e)
                 else:
-                    await ch.send(embed=discord.Embed(title="🔴 Serveur hors ligne", color=discord.Color.red()))
+                    e = discord.Embed(title="🔴 Serveur hors ligne", description=f"**{SERVER_DISPLAY_NAME}** est hors ligne.", color=discord.Color.red())
+                    await ch.send(embed=e)
     previous_status = online
 
 async def owner_check(interaction) -> bool:
